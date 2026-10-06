@@ -15,6 +15,7 @@ import (
 	"secureshare/api/internal/storage"
 	"strconv"
 	"time"
+"encoding/xml"
 )
 
 func main() {
@@ -22,6 +23,28 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+type s3ErrorResponse struct {
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
+func unsignedAccessDenied(status int, body []byte) bool {
+	switch status {
+	case 401, 403, 404:
+		return true
+	case 400:
+		var response s3ErrorResponse
+		if xml.Unmarshal(body, &response) != nil {
+			return false
+		}
+		return response.Code == "InvalidArgument" &&
+			response.Message == "Authorization"
+	default:
+		return false
+	}
+}
+
 func run() (success bool) {
 	confirm := flag.Bool("allow-temporary-object", false, "explicitly authorize a random temporary object in configured bucket")
 	flag.Parse()
@@ -90,10 +113,10 @@ func run() (success bool) {
 		return fail("URL parsing")
 	}
 	unsigned.RawQuery = ""
-	status, _, err = fetch(unsigned.String())
-	if err != nil || (status != 401 && status != 403 && status != 404) {
-		return fail("unsigned access denial")
-	}
+status, b, err = fetch(unsigned.String())
+if err != nil || !unsignedAccessDenied(status, b) {
+	return fail("unsigned access denial")
+}
 	if obj.Delete(ctx, key) != nil {
 		return fail("Delete")
 	}
