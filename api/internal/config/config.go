@@ -5,6 +5,9 @@ import (
 	"net/url"
 	"os"
 	"secureshare/api/internal/cleanup"
+	"secureshare/api/internal/clientip"
+	"secureshare/api/internal/ratelimit"
+	"secureshare/api/internal/shares"
 	"secureshare/api/internal/storage"
 	"strconv"
 	"time"
@@ -15,6 +18,9 @@ type Config struct {
 	Production                                                          bool
 	Storage                                                             storage.Options
 	Cleanup                                                             cleanup.Options
+	RedisURL, RateLimitSecret                                           string
+	ClientIP                                                            clientip.Resolver
+	Quotas                                                              shares.Quotas
 }
 
 func Load() (Config, error) {
@@ -73,6 +79,31 @@ func load(worker bool) (Config, error) {
 	}
 	if worker {
 		return c, nil
+	}
+	c.RedisURL = os.Getenv("REDIS_URL")
+	c.RateLimitSecret = os.Getenv("RATE_LIMIT_KEY_SECRET")
+	if _, err := ratelimit.Options(c.RedisURL); err != nil {
+		return c, err
+	}
+	if len(c.RateLimitSecret) < 32 || c.RateLimitSecret == c.Secret {
+		return c, errors.New("distinct RATE_LIMIT_KEY_SECRET of at least 32 random characters required")
+	}
+	c.ClientIP, err = clientip.Parse(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if err != nil {
+		return c, err
+	}
+	c.Quotas = shares.DefaultQuotas()
+	if raw := os.Getenv("MAX_STORED_FILE_BYTES_PER_USER"); raw != "" {
+		c.Quotas.StoredBytes, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || c.Quotas.StoredBytes < 1 {
+			return c, errors.New("invalid storage quota")
+		}
+	}
+	if raw := os.Getenv("MAX_NONTERMINAL_SHARES_PER_USER"); raw != "" {
+		c.Quotas.NonterminalShares, err = strconv.Atoi(raw)
+		if err != nil || c.Quotas.NonterminalShares < 1 || c.Quotas.NonterminalShares > 1000000 {
+			return c, errors.New("invalid share quota")
+		}
 	}
 	if len(c.Secret) < 32 {
 		return c, errors.New("DATABASE_URL and SESSION_SECRET (at least 32 characters) required")

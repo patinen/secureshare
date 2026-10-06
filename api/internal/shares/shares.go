@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"io"
+	"secureshare/api/internal/audit"
 	"secureshare/api/internal/storage"
 	"strings"
 	"time"
@@ -58,6 +59,7 @@ type Store struct {
 	DB      *pgxpool.Pool
 	Objects storage.Objects
 	TempDir string
+	Quotas  Quotas
 }
 
 type FileInput struct {
@@ -97,7 +99,18 @@ func (s Store) CreateFile(ctx context.Context, owner string, in FileInput) (Crea
 	key := "files/" + keyPart
 	name, kind := storage.Filename(in.FileName), storage.ContentType(in.ContentType)
 	var id string
-	err = s.DB.QueryRow(ctx, `INSERT INTO shares(user_id,type,title,token_hash,expires_at,max_redemptions,object_key,file_name,content_type,file_size,file_state) VALUES($1,'FILE',$2,$3,$4,$5,$6,$7,$8,$9,'PENDING') RETURNING id::text`, owner, in.Title, Hash(token), in.ExpiresAt, in.MaxRedemptions, key, name, kind, in.Size).Scan(&id)
+	reservation, err := s.DB.Begin(ctx)
+	if err != nil {
+		return Created{}, errors.New("file creation failed")
+	}
+	defer rollback(ctx, reservation)
+	if err = s.reserve(ctx, reservation, owner, in.Size); err != nil {
+		return Created{}, err
+	}
+	err = reservation.QueryRow(ctx, `INSERT INTO shares(user_id,type,title,token_hash,expires_at,max_redemptions,object_key,file_name,content_type,file_size,file_state) VALUES($1,'FILE',$2,$3,$4,$5,$6,$7,$8,$9,'PENDING') RETURNING id::text`, owner, in.Title, Hash(token), in.ExpiresAt, in.MaxRedemptions, key, name, kind, in.Size).Scan(&id)
+	if err == nil {
+		err = reservation.Commit(ctx)
+	}
 	if err != nil {
 		return Created{}, errors.New("file creation failed")
 	}
@@ -115,6 +128,9 @@ func (s Store) CreateFile(ctx context.Context, owner string, in FileInput) (Crea
 	var share Share
 	if err == nil {
 		share, err = scan(tx.QueryRow(ctx, `UPDATE shares SET file_state='READY',updated_at=now() WHERE id=$1 AND file_state='PENDING' RETURNING `+columns, id))
+	}
+	if err == nil {
+		err = audit.Insert(ctx, tx, owner, &id, "SHARE_FILE_CREATED")
 	}
 	if err == nil {
 		err = tx.Commit(ctx)
@@ -184,8 +200,22 @@ func (s Store) Create(ctx context.Context, owner string, in Input) (Created, err
 	if err != nil {
 		return Created{}, err
 	}
-	share, err := scan(s.DB.QueryRow(ctx, `INSERT INTO shares(user_id,type,title,text_content,token_hash,expires_at,max_redemptions) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+columns, owner, in.Type, in.Title, in.Text, Hash(token), in.ExpiresAt, in.MaxRedemptions))
+	tx, err := s.DB.Begin(ctx)
 	if err != nil {
+		return Created{}, err
+	}
+	defer rollback(ctx, tx)
+	if err = s.reserve(ctx, tx, owner, 0); err != nil {
+		return Created{}, err
+	}
+	share, err := scan(tx.QueryRow(ctx, `INSERT INTO shares(user_id,type,title,text_content,token_hash,expires_at,max_redemptions) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+columns, owner, in.Type, in.Title, in.Text, Hash(token), in.ExpiresAt, in.MaxRedemptions))
+	if err != nil {
+		return Created{}, err
+	}
+	if err = audit.Insert(ctx, tx, owner, &share.ID, "SHARE_TEXT_CREATED"); err != nil {
+		return Created{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return Created{}, err
 	}
 	return Created{Share: share, Token: token}, nil
@@ -212,25 +242,40 @@ func (s Store) Detail(ctx context.Context, owner, id string) (Share, error) {
 	return sh, err
 }
 func (s Store) Revoke(ctx context.Context, owner, id string) error {
-	tag, err := s.DB.Exec(ctx, `UPDATE shares SET revoked_at=COALESCE(revoked_at,clock_timestamp()),updated_at=clock_timestamp() WHERE user_id=$1 AND id::text=$2 AND `+visible, owner, id)
+	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	defer rollback(ctx, tx)
+	var revoked *time.Time
+	if err = tx.QueryRow(ctx, `SELECT revoked_at FROM shares WHERE user_id=$1 AND id::text=$2 AND `+visible+` FOR UPDATE`, owner, id).Scan(&revoked); errors.Is(err, pgx.ErrNoRows) {
 		return ErrUnavailable
+	} else if err != nil {
+		return err
 	}
-	return nil
+	if revoked != nil {
+		return tx.Commit(ctx)
+	}
+	_, err = tx.Exec(ctx, `UPDATE shares SET revoked_at=clock_timestamp(),updated_at=clock_timestamp() WHERE user_id=$1 AND id::text=$2`, owner, id)
+	if err != nil {
+		return err
+	}
+	if err = audit.Insert(ctx, tx, owner, &id, "SHARE_REVOKED"); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 func (s Store) Redeem(ctx context.Context, token string) (Public, error) {
 	var p Public
 	var text, key *string
+	var id, owner string
 	tx, err := s.DB.Begin(ctx)
 	if err != nil {
 		return p, err
 	}
 	defer tx.Rollback(ctx)
 	// PostgreSQL rechecks this predicate after waiting for any concurrent row lock.
-	err = tx.QueryRow(ctx, `UPDATE shares SET redemption_count=redemption_count+1,updated_at=now(),exhausted_at=CASE WHEN type='FILE' AND redemption_count+1=max_redemptions THEN clock_timestamp() ELSE exhausted_at END WHERE token_hash=$1 AND (type='TEXT' OR file_state='READY') AND revoked_at IS NULL AND expires_at>clock_timestamp() AND (max_redemptions IS NULL OR redemption_count<max_redemptions) RETURNING type,title,text_content,expires_at,object_key,file_name,file_size,content_type`, Hash(token)).Scan(&p.Type, &p.Title, &text, &p.ExpiresAt, &key, &p.FileName, &p.FileSize, &p.ContentType)
+	err = tx.QueryRow(ctx, `UPDATE shares SET redemption_count=redemption_count+1,updated_at=now(),exhausted_at=CASE WHEN type='FILE' AND redemption_count+1=max_redemptions THEN clock_timestamp() ELSE exhausted_at END WHERE token_hash=$1 AND (type='TEXT' OR file_state='READY') AND revoked_at IS NULL AND expires_at>clock_timestamp() AND (max_redemptions IS NULL OR redemption_count<max_redemptions) RETURNING type,title,text_content,expires_at,object_key,file_name,file_size,content_type,id::text,user_id::text`, Hash(token)).Scan(&p.Type, &p.Title, &text, &p.ExpiresAt, &key, &p.FileName, &p.FileSize, &p.ContentType, &id, &owner)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return p, ErrUnavailable
 	}
@@ -263,6 +308,9 @@ func (s Store) Redeem(ctx context.Context, token string) (Public, error) {
 	}
 	// No URL is returned until the transaction commits. Signing failure rolls back
 	// the access; delivery failures after commit still consume it.
+	if err = audit.Insert(ctx, tx, owner, &id, "SHARE_REDEEMED"); err != nil {
+		return Public{}, err
+	}
 	if err = tx.Commit(ctx); err != nil {
 		return Public{}, err
 	}

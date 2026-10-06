@@ -6,6 +6,7 @@ import (
 	"errors"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"secureshare/api/internal/audit"
 	"secureshare/api/internal/storage"
 	"secureshare/api/internal/uploads"
 	"time"
@@ -143,8 +144,8 @@ func (r Runner) cleanRow(ctx context.Context, conn *pgxpool.Conn, id string, pen
 		defer cancel()
 		_ = tx.Rollback(rollbackCtx)
 	}()
-	var state, key string
-	err = tx.QueryRow(ctx, `SELECT file_state,object_key FROM shares WHERE id=$1 AND type='FILE' AND ((file_state='PENDING' AND created_at<$2) OR (file_state='READY' AND LEAST(expires_at,revoked_at,exhausted_at)<$3)) FOR UPDATE SKIP LOCKED`, id, pendingBefore, terminalBefore).Scan(&state, &key)
+	var state, key, owner string
+	err = tx.QueryRow(ctx, `SELECT file_state,object_key,user_id::text FROM shares WHERE id=$1 AND type='FILE' AND ((file_state='PENDING' AND created_at<$2) OR (file_state='READY' AND LEAST(expires_at,revoked_at,exhausted_at)<$3)) FOR UPDATE SKIP LOCKED`, id, pendingBefore, terminalBefore).Scan(&state, &key, &owner)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", true
 	}
@@ -164,6 +165,9 @@ func (r Runner) cleanRow(ctx context.Context, conn *pgxpool.Conn, id string, pen
 		_, err = tx.Exec(ctx, `DELETE FROM shares WHERE id=$1 AND file_state='PENDING'`, id)
 	} else {
 		_, err = tx.Exec(ctx, `UPDATE shares SET file_state='PURGED',file_purged_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1 AND file_state='READY'`, id)
+		if err == nil {
+			err = audit.Insert(ctx, tx, owner, &id, "FILE_PURGED")
+		}
 	}
 	if err != nil || tx.Commit(ctx) != nil {
 		return "", false

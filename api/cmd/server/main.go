@@ -11,6 +11,7 @@ import (
 	"secureshare/api/internal/config"
 	"secureshare/api/internal/database"
 	apihttp "secureshare/api/internal/http"
+	"secureshare/api/internal/ratelimit"
 	"secureshare/api/internal/shares"
 	"secureshare/api/internal/storage"
 	"secureshare/api/internal/uploads"
@@ -44,7 +45,24 @@ func main() {
 	if err = uploads.Ensure(c.Cleanup.TempDir); err != nil {
 		log.Fatal("upload directory initialization failed")
 	}
-	server := &http.Server{Addr: ":" + c.Port, Handler: apihttp.Router(auth.New(c, users.Store{DB: db}), shares.Store{DB: db, Objects: objects, TempDir: c.Cleanup.TempDir}), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 150 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
+	limiter, err := ratelimit.New(c.RedisURL, c.RateLimitSecret)
+	if err != nil {
+		log.Fatal("rate limiter configuration failed")
+	}
+	defer limiter.Client.Close()
+	redisCtx, redisCancel := context.WithTimeout(ctx, 3*time.Second)
+	err = limiter.Check(redisCtx)
+	redisCancel()
+	if err != nil {
+		log.Fatal("rate limiter connection failed")
+	}
+	ready := func(ctx context.Context) error {
+		if err := db.Ping(ctx); err != nil {
+			return err
+		}
+		return limiter.Client.Ping(ctx).Err()
+	}
+	server := &http.Server{Addr: ":" + c.Port, Handler: apihttp.Router(auth.New(c, users.Store{DB: db}), shares.Store{DB: db, Objects: objects, TempDir: c.Cleanup.TempDir, Quotas: c.Quotas}, apihttp.Options{Limiter: limiter, Ready: ready}), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 150 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)

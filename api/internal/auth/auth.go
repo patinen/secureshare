@@ -23,6 +23,9 @@ type UserStore interface {
 	Get(context.Context, string) (users.User, error)
 }
 type Auth struct {
+	Auditor interface {
+		Record(context.Context, string, *string, string) error
+	}
 	Config               config.Config
 	Users                UserStore
 	Client               *http.Client
@@ -136,6 +139,12 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 	u, err := a.Users.Upsert(r.Context(), users.User{GitHubID: profile.ID, Login: profile.Login, Name: profile.Name, AvatarURL: profile.Avatar})
 	if err != nil {
 		http.Error(w, "Authentication unavailable", 500)
+		return
+	}
+	// Profile upsert commits first. Audit must persist before issuing a session;
+	// failed auditing leaves no login cookie, even though the account may exist.
+	if a.Auditor == nil || a.Auditor.Record(r.Context(), u.ID, nil, "AUTH_LOGIN") != nil {
+		http.Error(w, "Authentication unavailable", 503)
 		return
 	}
 	a.cookie(w, "session", a.Issue(u.ID), 7*24*3600)

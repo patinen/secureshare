@@ -8,6 +8,7 @@ async function proxy(
   const allowed =
     path[0] === "shares" ||
     path[0] === "auth" ||
+    path[0] === "audit" ||
     (path[0] === "public" && path[1] === "shares");
   if (!allowed) return new Response(null, { status: 404 });
   const origin = process.env.API_ORIGIN || "http://localhost:8080";
@@ -53,7 +54,14 @@ async function proxy(
       "Cache-Control": "no-store",
       "Referrer-Policy": "no-referrer",
     });
-    for (const name of ["content-type", "location"]) {
+    // Forward no browser-supplied client IP or request ID. Trusted edge
+    // forwarding needs an authenticated proxy chain established in Phase 5.
+    for (const name of [
+      "content-type",
+      "location",
+      "retry-after",
+      "x-request-id",
+    ]) {
       const value = upstream.headers.get(name);
       if (value) outgoing.set(name, value);
     }

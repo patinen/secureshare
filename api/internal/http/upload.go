@@ -112,6 +112,9 @@ func fileUpload(s shares.Store) http.HandlerFunc {
 			limit = &parsed
 		}
 		created, err := s.CreateFile(r.Context(), currentUser(r).ID, shares.FileInput{Title: title, ExpiresAt: expiry, MaxRedemptions: limit, FileName: name, ContentType: kind, Size: size, Body: file})
+		if quotaError(w, r, err) {
+			return
+		}
 		if errors.Is(err, shares.ErrInvalid) {
 			fail(w, 400, "Invalid file share: title up to 150 characters, expiry within 30 days, limit 1–1000, file 1 byte–25 MiB")
 			return

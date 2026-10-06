@@ -11,6 +11,9 @@ import (
 )
 
 type fakeUsers struct{ saved users.User }
+type fakeAudit struct{}
+
+func (fakeAudit) Record(context.Context, string, *string, string) error { return nil }
 
 func (f *fakeUsers) Upsert(_ context.Context, u users.User) (users.User, error) {
 	f.saved = u
@@ -65,6 +68,7 @@ func TestOAuthProfileOnly(t *testing.T) {
 	defer server.Close()
 	store := &fakeUsers{}
 	a := New(config.Config{Secret: strings.Repeat("s", 32), Origin: "http://localhost:3000"}, store)
+	a.Auditor = fakeAudit{}
 	a.TokenURL = server.URL + "/token"
 	a.ProfileURL = server.URL + "/user"
 	state := strings.Repeat("a", 43)

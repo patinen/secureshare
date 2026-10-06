@@ -1,4 +1,4 @@
-# SecureShare â€” Phase 3
+# SecureShare — Phase 4
 
 SecureShare creates temporary capability links for **plain text and files**. Creators sign in with GitHub; recipients need the secret link, never an account. Files live in a private S3-compatible bucket. Phase 1 text creation, ownership, expiry, and revocation remain intact; public redemption now uses **POST** for both types.
 
@@ -12,12 +12,16 @@ api/internal/cleanup/      PostgreSQL-coordinated retention and recovery
 api/internal/uploads/      Private upload spool and confined stale-file cleanup
 api/internal/auth/         GitHub OAuth / signed sessions
 api/internal/config/       Environment validation
+api/internal/ratelimit/    Redis Lua token buckets and opaque HMAC identities
+api/internal/clientip/     Explicit trusted-proxy client resolution
+api/internal/audit/        Append-only security events and bounded creator history
+api/internal/requestmeta/  Server-generated request IDs in context
 api/internal/database/     Embedded transactional migration runner
 api/internal/users/        Minimal GitHub profile persistence
 api/internal/shares/       Text/file lifecycle and atomic redemption
 api/internal/storage/      Put / Delete / PresignGet interface; AWS SDK Go v2
 api/internal/http/         chi handlers and integration tests
-api/migrations/            001/002 unchanged, 003 file lifecycle
+api/migrations/            001–003 unchanged, 004 security audit
 infra/minio/Dockerfile     Pinned official source builds for local MinIO + mc
 docker-compose.yml         PostgreSQL 16, Redis 7, private MinIO, API and worker
 ```
@@ -25,6 +29,52 @@ docker-compose.yml         PostgreSQL 16, Redis 7, private MinIO, API and worker
 Go uses chi/v5, pgx/v5/pgxpool and AWS SDK for Go v2 (`config`, `credentials`, `service/s3`). There is no ORM. Storage calls remain behind `storage.Objects`; most file tests use a local fake. Browser requests pass through a same-origin Next.js Route Handler to Go. The proxy forwards multipart bodies as a bounded binary stream, without buffering the whole upload or decoding it as text. Go spools to a private temporary file and deletes the temporary file on all handled exits.
 
 Migration 002 expands types to TEXT/FILE, makes `text_content` nullable, adds `object_key`, `file_name`, `content_type`, `file_size`, and enforces type-specific CHECK constraints. TEXT requires content and null file fields; FILE requires metadata and null text. A unique partial index prevents reuse of an object key. Existing TEXT rows are preserved. Migration 001 was not edited. The migration runner serializes startup with an advisory lock and records versions in `schema_migrations`; add numbered migrations rather than editing applied files.
+
+## Distributed abuse controls
+
+The API requires Redis 7 and uses [go-redis v9](https://redis.io/docs/latest/develop/connect/clients/go/) (pinned v9.23.0). One Lua token-bucket script atomically refills, checks, consumes and calculates retry time using Redis TIME. Multiple API replicas share Redis and the same policies/HMAC secret. Keys expire after the full-bucket refill duration following the last attempt; their values contain only fractional tokens and a timestamp. There is no fixed-window boundary burst. Sustained rates below include the explicitly allowed initial burst, rather than promising an exact rolling-window request count. See [Redis atomic limiter guidance](https://redis.io/docs/latest/develop/use-cases/rate-limiter/).
+
+| Protected operation | Actor | Refill per minute | Burst |
+|---|---|---|---|
+| POST public redemption | Resolved IP | 30 | 10 |
+| GET OAuth start | Resolved IP | 10 | 5 |
+| GET OAuth callback | Resolved IP | 20 | 10 |
+| POST TEXT create | Authenticated creator | 30 | 10 |
+| POST FILE create | Authenticated creator | 6 | 2 |
+| DELETE revoke | Authenticated creator | 30 | 10 |
+| POST logout | Authenticated creator | 30 | 10 |
+
+Public checks precede token validation/lookup, so malformed and unknown tokens consume the same IP policy. Creator checks follow authentication and precede body parsing/spooling. Denial returns generic **429 Too many requests** and ceiling-rounded Retry-After seconds; it never increments access counts or creates files/rows. Creator GET/list/detail/activity remain available without these mutation limits. The shared quota response described below also uses a clear creator-only error.
+
+`REDIS_URL` is required and accepts `redis://` or verified-TLS `rediss://`, including authentication/database settings. Invalid configuration, failed connection, or missing scripting/hash/expiry permissions prevents API startup. Runtime Redis errors fail protected operations closed with generic **503 Service temporarily unavailable**, distinct from 429. `/health` is cheap process liveness; `/ready` checks PostgreSQL and Redis within two seconds, without S3 writes or scans. Reads can continue during Redis failure. This deliberately trades mutation availability for bounded abuse exposure. A lost limiter acknowledgement may consume a bucket token while the API returns 503; it never proceeds to a share mutation. The independent cleanup worker still requires no Redis.
+
+`RATE_LIMIT_KEY_SECRET` must contain at least 32 independently generated random characters and differ from SESSION_SECRET. Generate a second secret with the README command below; never reuse capability material. Redis names contain only the policy and **HMAC-SHA256(secret, actor type + NUL + identity)**. IPs/user UUIDs are transient HMAC inputs and never appear as raw keys/values; HMAC identities are never stored in PostgreSQL or logged. Rotate/configure the secret consistently across replicas; rotation resets existing buckets. No request bodies, filenames, URLs or tokens enter Redis. Provision private Redis access with the commands used by scripting (EVAL/EVALSHA, SCRIPT LOAD, TIME, HMGET/HSET/PEXPIRE) and PING; production public Redis exposure is unnecessary.
+
+### Client IP and proxy boundary
+
+`TRUSTED_PROXY_CIDRS` defaults empty, so the direct RemoteAddr peer is authoritative. IPv4/IPv6 are supported and mapped IPv4 is normalized. Only a peer inside an explicitly configured CIDR may supply X-Forwarded-For. The resolver validates the whole bounded chain, then walks right to left through trusted proxies and stops at the first untrusted hop; entries further left cannot choose an identity. Missing/malformed/oversized chains fall back to the peer. Forwarded, X-Real-IP and CF-Connecting-IP are ignored.
+
+The Next.js proxy **does not forward browser-supplied IP/request-ID headers**. Until Phase 5 establishes an authenticated, sanitized edge chain, browser requests therefore share the Go API's immediate web-proxy peer bucket. Creator quotas/limits remain per authenticated user. Direct clients have independent peer limits, as verified in acceptance. NextRequest does not supply an independently verifiable network peer here, so trusting its arbitrary incoming forwarding headers would allow identity spoofing.
+
+Phase 5 must configure Cloudflare → Traefik/Coolify → web/API consistently, verify how authenticated forwarding reaches Go, restrict API access to intended peers, and trust only owned proxy CIDRs. Trusted proxies must append/replace headers correctly. Do not trust all networks or assume an arbitrary CF header proves Cloudflare provenance. This topology has not been production-validated or deployed.
+
+### Persistent quotas
+
+PostgreSQL is authoritative. Defaults: `MAX_STORED_FILE_BYTES_PER_USER=536870912` (512 MiB) and `MAX_NONTERMINAL_SHARES_PER_USER=500`, both positive and startup-validated. Every creation takes `SELECT ... FOR UPDATE` on its user row, checks usage, and commits the TEXT row or durable PENDING reservation in the same transaction. Concurrent TEXT/FILE creates serialize across replicas; the lock ends before the storage upload. Keep quota settings consistent across replicas.
+
+Storage bytes count **all PENDING and READY FILE rows**, including terminal files awaiting physical deletion; PURGED and TEXT count zero. Exactly at the byte quota succeeds. Over quota returns **413 Storage quota exceeded** before Put or persistent reservation. Spooling/validation may already have occurred, and its file is removed normally. Failed-upload reservations remain counted until successful cleanup removes PENDING; PURGED releases bytes.
+
+The share quota counts every recoverable PENDING plus unrevoked, unexpired, unexhausted TEXT/READY rows. Expired/revoked/exhausted history and PURGED do not count. A new row beyond the limit returns **429 Active share quota exceeded** before persistent creation. It has no time-based Retry-After: release depends on terminal transition/recovery. Historical rows are retained; rate limits bound creation rate but this phase does not add historical-data retention.
+
+### Audit, activity and safe operations
+
+Migration **004_security_audit.sql** adds `audit_events`: UUID id, nullable user/share UUID references, constrained event type, nullable server request ID, and creation timestamp. It has a recent-owner index and no content/IP/storage columns. References intentionally do not cascade or require a live share, preserving append-only history. Database triggers reject UPDATE, DELETE and TRUNCATE; future retention must explicitly alter these guards in a migration. Normal application code contains only INSERT/SELECT and there is no deletion UI. These guards do not replace production database-role privileges.
+
+Events: AUTH_LOGIN, AUTH_LOGOUT, SHARE_TEXT_CREATED, SHARE_FILE_CREATED, SHARE_REDEEMED, SHARE_REVOKED, FILE_PURGED. Share mutations and their events commit together. FILE creation is audited at READY, not PENDING. Signing/audit failure rolls back access counts. Revoke records one event on the first transition and repeats idempotently. Purge deletion precedes the PURGED/event transaction; audit/DB failure preserves READY and retries idempotent Delete. Login commits profile upsert, then audit, then session issuance; audit failure issues no session. Authenticated logout audits before clearing its cookie; audit failure returns 503. Delivery can fail after an event commits; events describe successful server-side actions, not exactly-once browser receipt. Existing pre-Phase-4 actions are not backfilled.
+
+Authenticated `GET /audit` returns only the caller's recent events (default 50, max 100 via `limit`). There is no paging or cross-user selector. It returns safe id/type/time and optional share/request IDs, never user IDs, contents, filenames, tokens, hashes, IPs or storage paths. The dashboard adds a small recent-activity section with labels/timestamps and existing Refresh behavior. Random invalid-token traffic and rate-limit rejections intentionally produce **no PostgreSQL audit events**, avoiding audit amplification.
+
+Every Go API request gets a fresh cryptographically random 128-bit ID, exposed as X-Request-ID and in context/audit. Inbound IDs are ignored; Next forwards the generated response ID and Retry-After. Operational logs contain ID, an allowlisted method, normalized chi route pattern, status and duration. Unknown routes use UNMATCHED. Security logs add only safe policy/failure categories. Panic recovery omits panic values/stacks that might contain secrets. Raw paths/URIs, query strings, bodies, cookies, Authorization, OAuth codes, tokens, presigned URLs, raw IPs and HMAC actor identities are never logged. Keep future proxy/access logs equally secret-safe.
 
 ## Capability and storage security
 
@@ -41,9 +91,9 @@ Text is plaintext in PostgreSQL and files are plaintext object contents unless t
 
 ## Upload and redemption lifecycle
 
-`POST /shares/file` accepts multipart `file`, optional `title`, required `expiresAt` (future ISO timestamp, within 30 days), optional `maxRedemptions` (1â€“1000; omitted/empty means unlimited). The title limit remains 150 characters.
+`POST /shares/file` accepts multipart `file`, optional `title`, required `expiresAt` (future ISO timestamp, within 30 days), optional `maxRedemptions` (1–1000; omitted/empty means unlimited). The title limit remains 150 characters.
 
-Upload order: authenticate â†’ spool a bounded temporary file â†’ validate all fields/actual size â†’ generate capability token/hash and independent random object key â†’ durably insert **PENDING** â†’ upload private object â†’ commit **READY** â†’ return metadata and token once. A failed PENDING insert never uploads. A transaction holds the PENDING row lock during the bounded upload/finalization; cleanup skips that locked row. PENDING is hidden from creator APIs and cannot be redeemed. The raw token is never returned before the READY commit succeeds.
+Upload order: authenticate → spool a bounded temporary file → validate all fields/actual size → generate capability token/hash and independent random object key → durably insert **PENDING** → upload private object → commit **READY** → return metadata and token once. A failed PENDING insert never uploads. A transaction holds the PENDING row lock during the bounded upload/finalization; cleanup skips that locked row. PENDING is hidden from creator APIs and cannot be redeemed. The raw token is never returned before the READY commit succeeds.
 
 Upload errors, ambiguous Put results and failed finalization trigger best-effort Delete with an independent ten-second context, including after request cancellation. Delete must succeed before removing the PENDING recovery row. Failed deletion or DB removal leaves a record for worker retry. An uncertain READY commit is checked under a row lock: cleanup never deletes an object belonging to a row that committed READY. A READY commit can succeed even when the client disconnects before receiving its raw token; its metadata remains visible, but the secret cannot be recovered.
 
@@ -53,7 +103,7 @@ Revoke remains logical access control: it soft-updates `revoked_at`, without del
 
 ## Retention and recovery worker
 
-The separate `cmd/worker` process exposes no HTTP port or public domain. It uses the same PostgreSQL and `storage.Objects` configuration as the API, needs no OAuth/session settings, migrates safely on startup, sweeps immediately and periodically, and stops cleanly on SIGTERM. Redis remains unused. `cleanup.RunOnce` is independently testable.
+The separate `cmd/worker` process exposes no HTTP port or public domain. It uses the same PostgreSQL and `storage.Objects` configuration as the API, needs no OAuth/session/Redis settings, migrates safely on startup, sweeps immediately and periodically, and stops cleanly on SIGTERM. Phase 4 adds a transactional FILE_PURGED event without changing its PostgreSQL coordination. `cleanup.RunOnce` is independently testable.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -62,7 +112,7 @@ The separate `cmd/worker` process exposes no HTTP port or public domain. It uses
 | PENDING_UPLOAD_GRACE | 1h | Positive stale-PENDING and local spool threshold |
 | UPLOAD_TEMP_DIR | `<os temp>/secureshare-uploads` | Private spool shared by API and worker |
 
-Each sweep handles up to 200 DB candidates. Stale PENDING: Delete the known key, then remove the row. Terminal READY after grace: Delete, then mark **PURGED** with `file_purged_at`; keep historical metadata and the internal object key. Delete errors preserve the state for retry. If Delete succeeded but PostgreSQL persistence fails, the next sweep repeats the idempotent Delete. Already-missing objects are safe to delete. PURGED rows are not deleted or processed again. Creator FILE metadata includes only derived `fileAvailable` (READY true, PURGED false); the dashboard adds â€œStored file removedâ€ while preserving filename, size and normal historical status.
+Each sweep handles up to 200 DB candidates. Stale PENDING: Delete the known key, then remove the row. Terminal READY after grace: Delete, then mark **PURGED** with `file_purged_at`; keep historical metadata and the internal object key. Delete errors preserve the state for retry. If Delete succeeded but PostgreSQL persistence fails, the next sweep repeats the idempotent Delete. Already-missing objects are safe to delete. PURGED rows are not deleted or processed again. Creator FILE metadata includes only derived `fileAvailable` (READY true, PURGED false); the dashboard adds “Stored file removed” while preserving filename, size and normal historical status.
 
 A PostgreSQL **session advisory lock on a pinned pool connection** serializes sweeps. A competing worker skips its sweep. Per-record transactions recheck eligibility using `FOR UPDATE SKIP LOCKED`, so active uploads remain protected. Unlock uses a separate bounded context; failed or uncertain lock acknowledgements discard the connection instead of pooling it. Do not put this worker behind a transaction-pooling PostgreSQL proxy: it requires a session-stable connection. Storage deletion is bounded to ten seconds per record. Logs contain summary counts and generic failures, never keys, tokens, URLs, credentials, filenames or content. There is no bucket-wide listing and no new ListBucket permission requirement.
 
@@ -78,7 +128,7 @@ Native Linux: export configuration and run `go run ./cmd/worker` or `go run ./cm
 
 PostgreSQL and object storage still have no distributed transaction. Recovery is eventual and depends on the worker, database and provider being available; it cannot promise exactly-once network delivery or eliminate every ambiguous late remote operation. Provider versioning, retention locks and permission policies need deployment-specific verification: a successful Delete must remove the downloadable object under that provider's policy. Historical metadata has no automatic deletion policy in Phase 3.
 
-`POST /public/shares/:token/redeem` hashes the supplied token and performs a single conditional `UPDATE â€¦ RETURNING` inside a transaction. The database checks revocation, expiry, and remaining redemptions, and increments the count atomically. Concurrent one-time redemptions produce exactly one success for either share type. FILE signing happens before commit; a signing failure rolls back the count. A response is returned only after commit.
+`POST /public/shares/:token/redeem` hashes the supplied token and performs a single conditional `UPDATE … RETURNING` inside a transaction. The database checks revocation, expiry, and remaining redemptions, and increments the count atomically. Concurrent one-time redemptions produce exactly one success for either share type. FILE signing happens before commit; a signing failure rolls back the count. A response is returned only after commit.
 
 TEXT responses contain `type`, `title`, `text`, `expiresAt`. FILE responses contain `type`, `title`, `expiresAt`, `fileName`, `fileSize`, normalized `contentType`, `downloadUrl`; they omit owner identity, database IDs, counts and hashes. Unavailable states all return `404 {"error":"Share not available"}`. GET/HEAD cannot redeem; the old Phase 1 public GET endpoint has been removed.
 
@@ -94,10 +144,10 @@ API responses use no-store, no-referrer, nosniff, frame protection and productio
 
 ## Local development
 
-Requires Node.js 20.9+ with **npm**, and Docker Desktop. Native API development uses Go 1.26. Redis remains unused in application logic.
+Requires Node.js 20.9+ with **npm**, and Docker Desktop. Native Linux API development uses Go 1.26. Redis 7 is required for API abuse controls.
 
-1. Copy `api/.env.example` â†’ `api/.env`, `web/.env.example` â†’ `web/.env.local`. When upgrading from Phase 1, add all `S3_*` settings to the existing ignored API env file.
-2. Generate SESSION_SECRET: `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`; put it in `api/.env`.
+1. Copy `api/.env.example` → `api/.env`, `web/.env.example` → `web/.env.local`. When upgrading from Phase 1, add all `S3_*` settings to the existing ignored API env file.
+2. Run `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"` twice. Put the distinct values into SESSION_SECRET and RATE_LIMIT_KEY_SECRET in ignored `api/.env`. When upgrading, add REDIS_URL and the quota/proxy defaults from `.env.example`; Compose overrides the Redis URL to its private service.
 3. Register a GitHub OAuth App: homepage `http://localhost:3000`, callback `http://localhost:3000/api/auth/github/callback`. Fill the GitHub client credentials in the ignored API env file.
 4. From this directory: `docker compose up -d --build postgres redis minio minio-init api worker`. The first MinIO build downloads pinned official [MinIO server](https://github.com/minio/minio) and [mc client](https://github.com/minio/mc) source releases and can take several minutes. Registry images were unavailable during validation, so no unofficial mirror is used. This pinned community build is **local development infrastructure**, not a production recommendation.
 5. In `web/`: `npm ci`, `npm run dev`. Open `http://localhost:3000`.
@@ -133,6 +183,9 @@ Production endpoints must be HTTPS. Provision a private bucket and least-privile
 | GET | /shares/:id | Owner detail; textContent for TEXT, safe metadata for FILE |
 | DELETE | /shares/:id | Soft revoke; foreign/unknown = 404 |
 | POST | /public/shares/:token/redeem | Atomic TEXT/FILE redemption |
+| GET | /audit?limit=50 | Own recent append-only events; limit 1–100 |
+| GET | /health | Cheap process liveness |
+| GET | /ready | PostgreSQL + Redis readiness |
 
 TEXT create payload remains `{ "type":"TEXT", "title":null, "text":"hello", "expiresAt":"<future ISO timestamp>", "maxRedemptions":1 }`. Use browser-origin headers for direct mutation requests (`Origin: http://localhost:3000` locally).
 
@@ -146,10 +199,10 @@ For PostgreSQL integration tests, create a **dedicated** database once (`created
 
 ```sh
 docker compose exec postgres createdb -U secureshare_local secureshare_test
-docker compose run --rm --no-deps -e TEST_DATABASE_URL=postgres://secureshare_local:local_development_only@postgres:5432/secureshare_test?sslmode=disable api go test -race ./...
+docker compose run --rm --no-deps -e TEST_DATABASE_URL=postgres://secureshare_local:local_development_only@postgres:5432/secureshare_test?sslmode=disable -e TEST_REDIS_URL=redis://redis:6379/15 api go test -race ./...
 ```
 
-The suite verifies unchanged migration hashes, upgrades isolated Phase 1/2 schemas, enforces lifecycle/type constraints, checks upload/finalization/cancellation recovery, tests terminal retention and idempotent DB/storage failures, verifies worker coordination and spool safety, and races actual PostgreSQL redemptions for FILE and TEXT. It uses only local PostgreSQL and httptest HTTP servers, never public internet. Integration tests skip without TEST_DATABASE_URL. The browser acceptance check uses real local MinIO.
+The suite verifies unchanged migration hashes, lifecycle constraints/recovery, atomic FILE/TEXT redemptions, storage signing, quota races, audit consistency/immutability/ownership, IP spoofing, secret-safe logs and distributed Redis buckets/TTL/recovery. Isolated schema fixtures coordinate across packages so database-wide worker locks cannot cause unrelated fake sweeps to skip; concurrency inside each fixture remains real. It uses only local PostgreSQL, Redis and httptest servers. Integration tests skip without their respective TEST_DATABASE_URL/TEST_REDIS_URL. Use a dedicated local Redis DB (15 above); tests remove their own opaque keys. Real local browser acceptance uses MinIO and Redis.
 
 In `web/`: `npm run lint`, `npm run build`.
 
@@ -157,7 +210,6 @@ Manual acceptance: sign in; create a one-time FILE; copy its secret URL; open a 
 
 ## Remaining scope and roadmap
 
-Rate limiting/audit/abuse protection, malware scanning, production deployment and provider-specific validation remain future work. Existing limitations include latest-200 listing, signed sessions without server-side revocation registry, plaintext contents and CSP permitting inline framework scripts/styles. Already-issued presigned URLs remain usable until expiry unless their objects are later purged; a transfer in progress may finish. One-time means one committed redemption, and network delivery cannot be exactly-once. Keep local MinIO credentials and the source-built community service out of production.
+Malware scanning, production deployment and provider-specific validation remain future work. This is not end-to-end encrypted. Session cookies still have no server-side revocation registry. Existing limits include latest-200 shares, recent-only activity, retained historical metadata and inline framework CSP. Already-issued presigned URLs remain usable until expiry unless objects are later purged; transfers in progress may finish. Network delivery cannot be exactly-once. Live AWS S3/R2 and Cloudflare/Traefik forwarding remain unverified. IP quotas cannot stop all distributed/rotating-IP abuse; private trusted-edge setup and production capacity/retention policies still need validation. Keep development credentials and the source-built local MinIO service out of production. No production deployment was performed.
 
-- Phase 4: rate limiting / audit / abuse protection
-- Phase 5: production deployment / provider validation / polish
+- Phase 5: production deployment / provider validation / security polish

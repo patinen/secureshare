@@ -16,6 +16,11 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["127.0.0.1:56379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
   minio:
     image: secureshare-minio-local:2025-09-07
     build: ./infra/minio
@@ -47,12 +52,15 @@ services:
     env_file: ./api/.env
     environment:
       DATABASE_URL: postgres://secureshare_local:local_development_only@postgres:5432/secureshare_local?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT: http://minio:9000
       S3_DOWNLOAD_ENDPOINT: http://localhost:59000
       UPLOAD_TEMP_DIR: /var/lib/secureshare/uploads
     ports: ["127.0.0.1:8080:8080"]
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully

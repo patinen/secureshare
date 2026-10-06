@@ -417,7 +417,7 @@ func TestCleanupCoordination(t *testing.T) {
 			t.Fatal("session lock leaked")
 		}
 		var locks int
-		if err := f.db.QueryRow(context.Background(), `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=$1::oid AND granted`, lockID).Scan(&locks); err != nil || locks != 0 {
+		if err := f.db.QueryRow(context.Background(), `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=$1::oid AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())`, lockID).Scan(&locks); err != nil || locks != 0 {
 			t.Fatal("session lock remained in pool")
 		}
 	})
@@ -454,7 +454,7 @@ func TestCleanupCoordination(t *testing.T) {
 			t.Fatal("cancel leaked lock or row")
 		}
 		var locks int
-		if err := f.db.QueryRow(context.Background(), `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=$1::oid AND granted`, lockID).Scan(&locks); err != nil || locks != 0 {
+		if err := f.db.QueryRow(context.Background(), `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND objid=$1::oid AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())`, lockID).Scan(&locks); err != nil || locks != 0 {
 			t.Fatal("cancel retained session lock")
 		}
 	})

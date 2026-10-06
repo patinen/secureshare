@@ -116,7 +116,7 @@ func TestFileIntegration(t *testing.T) {
 	objects := &fakeObjects{}
 	store := shares.Store{DB: db, Objects: objects, TempDir: scratch}
 	a := auth.New(config.Config{Origin: "http://localhost:3000", Secret: strings.Repeat("s", 32)}, us)
-	handler := Router(a, store)
+	handler := Router(a, store, Options{Limiter: allowAll{}})
 	call := func(method, path, who string, body io.Reader, contentType string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, body)
 		r.ContentLength = -1

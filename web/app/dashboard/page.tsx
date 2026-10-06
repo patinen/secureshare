@@ -16,6 +16,16 @@ type Share = {
   maxRedemptions: number | null;
   revokedAt: string | null;
 };
+type Activity = { id: string; type: string; createdAt: string };
+const activityLabels: Record<string, string> = {
+  AUTH_LOGIN: "Signed in",
+  AUTH_LOGOUT: "Signed out",
+  SHARE_TEXT_CREATED: "Created text share",
+  SHARE_FILE_CREATED: "Created file share",
+  SHARE_REDEEMED: "Share redeemed",
+  SHARE_REVOKED: "Share revoked",
+  FILE_PURGED: "Stored file removed",
+};
 async function api(path: string, init?: RequestInit) {
   const r = await fetch("/api" + path, { ...init, cache: "no-store" });
   if (!r.ok) {
@@ -52,6 +62,8 @@ export default function Dashboard() {
     [text, setText] = useState(""),
     [hours, setHours] = useState("24"),
     [limit, setLimit] = useState("1");
+  const [activity, setActivity] = useState<Activity[]>([]);
+  const [activityError, setActivityError] = useState("");
   useEffect(() => {
     let alive = true;
     api("/auth/me")
@@ -61,6 +73,13 @@ export default function Dashboard() {
       })
       .then((s) => {
         if (alive) setList(s);
+        return api("/audit")
+          .then((events) => {
+            if (alive) setActivity(events);
+          })
+          .catch(() => {
+            if (alive) setActivityError("Activity unavailable. Try Refresh.");
+          });
       })
       .catch((e) => {
         if (alive) setError(e.message);
@@ -74,6 +93,12 @@ export default function Dashboard() {
   }, []);
   async function refresh() {
     setList(await api("/shares"));
+    try {
+      setActivity(await api("/audit"));
+      setActivityError("");
+    } catch {
+      setActivityError("Activity unavailable. Try Refresh.");
+    }
   }
   async function create(e: React.FormEvent) {
     e.preventDefault();
@@ -156,6 +181,7 @@ export default function Dashboard() {
               setUser(null);
               setUrl("");
               setList([]);
+              setActivity([]);
               router.replace("/");
             } catch {
               setError("Unable to sign out");
@@ -369,6 +395,26 @@ export default function Dashboard() {
               </tbody>
             </table>
           </div>
+        )}
+      </section>
+      <section className="panel sharelist" aria-label="Recent activity">
+        <h2>Recent activity</h2>
+        <p className="muted">Your 50 most recent actions. Refresh to update.</p>
+        {activityError && <p role="status">{activityError}</p>}
+        {activity.length === 0 ? (
+          <p className="muted">No activity yet.</p>
+        ) : (
+          <ul>
+            {activity.map((event) => (
+              <li key={event.id}>
+                {activityLabels[event.type] || "Share activity"}
+                {" · "}
+                <time dateTime={event.createdAt}>
+                  {new Date(event.createdAt).toLocaleString()}
+                </time>
+              </li>
+            ))}
+          </ul>
         )}
       </section>
     </>

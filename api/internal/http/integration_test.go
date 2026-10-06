@@ -50,7 +50,7 @@ func TestIntegration(t *testing.T) {
 	}()
 	a := auth.New(config.Config{Origin: "http://localhost:3000", Secret: strings.Repeat("s", 32)}, us)
 	store := shares.Store{DB: db}
-	handler := Router(a, store)
+	handler := Router(a, store, Options{Limiter: allowAll{}})
 	call := func(method, path, who string, body any) *httptest.ResponseRecorder {
 		var payload bytes.Buffer
 		if body != nil {
