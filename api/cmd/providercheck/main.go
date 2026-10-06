@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
@@ -15,7 +16,6 @@ import (
 	"secureshare/api/internal/storage"
 	"strconv"
 	"time"
-"encoding/xml"
 )
 
 func main() {
@@ -113,10 +113,10 @@ func run() (success bool) {
 		return fail("URL parsing")
 	}
 	unsigned.RawQuery = ""
-status, b, err = fetch(unsigned.String())
-if err != nil || !unsignedAccessDenied(status, b) {
-	return fail("unsigned access denial")
-}
+	status, b, err = fetch(unsigned.String())
+	if err != nil || !unsignedAccessDenied(status, b) {
+		return fail("unsigned access denial")
+	}
 	if obj.Delete(ctx, key) != nil {
 		return fail("Delete")
 	}
