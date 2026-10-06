@@ -9,3 +9,5 @@ api/server.exe
 *.log
 .validation/
 web/tsconfig.tsbuildinfo
+api/worker
+api/worker.exe

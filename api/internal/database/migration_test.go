@@ -89,7 +89,7 @@ func TestFileMigration(t *testing.T) {
 		})
 	}
 	t.Run("valid_file_state", func(t *testing.T) {
-		if _, err := db.Exec(ctx, "UPDATE shares SET type='FILE',text_content=NULL,object_key='files/'||repeat('a',43),file_name='test',file_size=26214400,content_type='application/octet-stream' WHERE id=$1", id); err != nil {
+		if _, err := db.Exec(ctx, "UPDATE shares SET type='FILE',file_state='READY',text_content=NULL,object_key='files/'||repeat('a',43),file_name='test',file_size=26214400,content_type='application/octet-stream' WHERE id=$1", id); err != nil {
 			t.Fatal("valid FILE state rejected")
 		}
 	})

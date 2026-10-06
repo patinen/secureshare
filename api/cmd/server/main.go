@@ -13,6 +13,7 @@ import (
 	apihttp "secureshare/api/internal/http"
 	"secureshare/api/internal/shares"
 	"secureshare/api/internal/storage"
+	"secureshare/api/internal/uploads"
 	"secureshare/api/internal/users"
 	"syscall"
 	"time"
@@ -40,7 +41,10 @@ func main() {
 	if err != nil {
 		log.Fatal("storage configuration failed")
 	}
-	server := &http.Server{Addr: ":" + c.Port, Handler: apihttp.Router(auth.New(c, users.Store{DB: db}), shares.Store{DB: db, Objects: objects}), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 150 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
+	if err = uploads.Ensure(c.Cleanup.TempDir); err != nil {
+		log.Fatal("upload directory initialization failed")
+	}
+	server := &http.Server{Addr: ":" + c.Port, Handler: apihttp.Router(auth.New(c, users.Store{DB: db}), shares.Store{DB: db, Objects: objects, TempDir: c.Cleanup.TempDir}), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 150 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -42,14 +42,32 @@ services:
   api:
     image: golang:1.26-bookworm
     working_dir: /app
-    volumes: ["./api:/app", "go_modules:/go/pkg/mod", "go_build:/root/.cache/go-build"]
+    volumes: ["./api:/app", "go_modules:/go/pkg/mod", "go_build:/root/.cache/go-build", "upload_spool:/var/lib/secureshare"]
     command: go run ./cmd/server
     env_file: ./api/.env
     environment:
       DATABASE_URL: postgres://secureshare_local:local_development_only@postgres:5432/secureshare_local?sslmode=disable
       S3_ENDPOINT: http://minio:9000
       S3_DOWNLOAD_ENDPOINT: http://localhost:59000
+      UPLOAD_TEMP_DIR: /var/lib/secureshare/uploads
     ports: ["127.0.0.1:8080:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+  worker:
+    image: golang:1.26-bookworm
+    working_dir: /app
+    volumes: ["./api:/app", "go_modules:/go/pkg/mod", "go_build:/root/.cache/go-build", "upload_spool:/var/lib/secureshare"]
+    command: ["sh", "-ec", "go build -o /tmp/secureshare-worker ./cmd/worker; exec /tmp/secureshare-worker"]
+    env_file: ./api/.env
+    environment:
+      DATABASE_URL: postgres://secureshare_local:local_development_only@postgres:5432/secureshare_local?sslmode=disable
+      S3_ENDPOINT: http://minio:9000
+      S3_DOWNLOAD_ENDPOINT: http://localhost:59000
+      UPLOAD_TEMP_DIR: /var/lib/secureshare/uploads
+    stop_grace_period: 20s
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,3 +78,4 @@ volumes:
   go_modules:
   go_build:
   minio_data:
+  upload_spool:

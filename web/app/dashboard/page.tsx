@@ -8,6 +8,7 @@ type Share = {
   type: "TEXT" | "FILE";
   fileName?: string;
   fileSize?: number;
+  fileAvailable?: boolean;
   title: string | null;
   createdAt: string;
   expiresAt: string;
@@ -352,6 +353,9 @@ export default function Dashboard() {
                       <span className={"badge " + status(s).toLowerCase()}>
                         {status(s)}
                       </span>
+                      {s.type === "FILE" && s.fileAvailable === false && (
+                        <div className="muted">Stored file removed</div>
+                      )}
                     </td>
                     <td>
                       {!s.revokedAt && (

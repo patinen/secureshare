@@ -38,6 +38,7 @@ type Share struct {
 	FileName        *string    `json:"fileName,omitempty"`
 	FileSize        *int64     `json:"fileSize,omitempty"`
 	ContentType     *string    `json:"contentType,omitempty"`
+	FileAvailable   *bool      `json:"fileAvailable,omitempty"`
 }
 type Public struct {
 	Type        string    `json:"type"`
@@ -56,6 +57,7 @@ type Created struct {
 type Store struct {
 	DB      *pgxpool.Pool
 	Objects storage.Objects
+	TempDir string
 }
 
 type FileInput struct {
@@ -94,21 +96,61 @@ func (s Store) CreateFile(ctx context.Context, owner string, in FileInput) (Crea
 	}
 	key := "files/" + keyPart
 	name, kind := storage.Filename(in.FileName), storage.ContentType(in.ContentType)
-	cleanup := func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancel()
-		_ = s.Objects.Delete(cleanupCtx, key)
-	}
-	if err = s.Objects.Put(ctx, key, in.Body, in.Size, kind); err != nil {
-		cleanup()
-		return Created{}, errors.New("file upload failed")
-	}
-	share, err := scan(s.DB.QueryRow(ctx, `INSERT INTO shares(user_id,type,title,token_hash,expires_at,max_redemptions,object_key,file_name,content_type,file_size) VALUES($1,'FILE',$2,$3,$4,$5,$6,$7,$8,$9) RETURNING `+columns, owner, in.Title, Hash(token), in.ExpiresAt, in.MaxRedemptions, key, name, kind, in.Size))
+	var id string
+	err = s.DB.QueryRow(ctx, `INSERT INTO shares(user_id,type,title,token_hash,expires_at,max_redemptions,object_key,file_name,content_type,file_size,file_state) VALUES($1,'FILE',$2,$3,$4,$5,$6,$7,$8,$9,'PENDING') RETURNING id::text`, owner, in.Title, Hash(token), in.ExpiresAt, in.MaxRedemptions, key, name, kind, in.Size).Scan(&id)
 	if err != nil {
-		cleanup()
-		return Created{}, err
+		return Created{}, errors.New("file creation failed")
+	}
+	// The durable recovery record precedes the upload. Holding its row lock
+	// prevents cleanup from deleting an upload that is still in progress.
+	tx, err := s.DB.Begin(ctx)
+	if err == nil {
+		err = tx.QueryRow(ctx, `SELECT id::text FROM shares WHERE id=$1 AND file_state='PENDING' FOR UPDATE`, id).Scan(&id)
+	}
+	if err == nil {
+		uploadCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		err = s.Objects.Put(uploadCtx, key, in.Body, in.Size, kind)
+		cancel()
+	}
+	var share Share
+	if err == nil {
+		share, err = scan(tx.QueryRow(ctx, `UPDATE shares SET file_state='READY',updated_at=now() WHERE id=$1 AND file_state='PENDING' RETURNING `+columns, id))
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+	if tx != nil {
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		_ = tx.Rollback(rollbackCtx)
+		cancel()
+	}
+	if err != nil {
+		s.cleanupPending(ctx, id)
+		return Created{}, errors.New("file creation failed")
 	}
 	return Created{Share: share, Token: token}, nil
+}
+
+// Never delete a READY object after an ambiguous commit. A lost response can
+// leave a READY share whose original token is irrecoverable.
+func (s Store) cleanupPending(ctx context.Context, id string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback(ctx)
+	var key string
+	if tx.QueryRow(ctx, `SELECT object_key FROM shares WHERE id=$1 AND file_state='PENDING' FOR UPDATE`, id).Scan(&key) != nil {
+		return
+	}
+	if s.Objects.Delete(ctx, key) != nil {
+		return
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM shares WHERE id=$1 AND file_state='PENDING'`, id); err == nil {
+		_ = tx.Commit(ctx)
+	}
 }
 
 func Token() (string, error) {
@@ -126,11 +168,12 @@ func Validate(in Input, now time.Time) error {
 	return nil
 }
 
-const columns = `id::text,type,title,expires_at,max_redemptions,redemption_count,revoked_at,created_at,file_name,file_size,content_type`
+const columns = `id::text,type,title,expires_at,max_redemptions,redemption_count,revoked_at,created_at,file_name,file_size,content_type,CASE WHEN type='FILE' THEN file_state='READY' END`
+const visible = `(type='TEXT' OR file_state IN ('READY','PURGED'))`
 
 func scan(row pgx.Row) (Share, error) {
 	var s Share
-	err := row.Scan(&s.ID, &s.Type, &s.Title, &s.ExpiresAt, &s.MaxRedemptions, &s.RedemptionCount, &s.RevokedAt, &s.CreatedAt, &s.FileName, &s.FileSize, &s.ContentType)
+	err := row.Scan(&s.ID, &s.Type, &s.Title, &s.ExpiresAt, &s.MaxRedemptions, &s.RedemptionCount, &s.RevokedAt, &s.CreatedAt, &s.FileName, &s.FileSize, &s.ContentType, &s.FileAvailable)
 	return s, err
 }
 func (s Store) Create(ctx context.Context, owner string, in Input) (Created, error) {
@@ -148,7 +191,7 @@ func (s Store) Create(ctx context.Context, owner string, in Input) (Created, err
 	return Created{Share: share, Token: token}, nil
 }
 func (s Store) List(ctx context.Context, owner string) ([]Share, error) {
-	rows, err := s.DB.Query(ctx, `SELECT `+columns+` FROM shares WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200`, owner)
+	rows, err := s.DB.Query(ctx, `SELECT `+columns+` FROM shares WHERE user_id=$1 AND `+visible+` ORDER BY created_at DESC LIMIT 200`, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -165,11 +208,11 @@ func (s Store) List(ctx context.Context, owner string) ([]Share, error) {
 }
 func (s Store) Detail(ctx context.Context, owner, id string) (Share, error) {
 	var sh Share
-	err := s.DB.QueryRow(ctx, `SELECT `+columns+`,text_content FROM shares WHERE user_id=$1 AND id::text=$2`, owner, id).Scan(&sh.ID, &sh.Type, &sh.Title, &sh.ExpiresAt, &sh.MaxRedemptions, &sh.RedemptionCount, &sh.RevokedAt, &sh.CreatedAt, &sh.FileName, &sh.FileSize, &sh.ContentType, &sh.Text)
+	err := s.DB.QueryRow(ctx, `SELECT `+columns+`,text_content FROM shares WHERE user_id=$1 AND id::text=$2 AND `+visible, owner, id).Scan(&sh.ID, &sh.Type, &sh.Title, &sh.ExpiresAt, &sh.MaxRedemptions, &sh.RedemptionCount, &sh.RevokedAt, &sh.CreatedAt, &sh.FileName, &sh.FileSize, &sh.ContentType, &sh.FileAvailable, &sh.Text)
 	return sh, err
 }
 func (s Store) Revoke(ctx context.Context, owner, id string) error {
-	tag, err := s.DB.Exec(ctx, `UPDATE shares SET revoked_at=COALESCE(revoked_at,now()),updated_at=now() WHERE user_id=$1 AND id::text=$2`, owner, id)
+	tag, err := s.DB.Exec(ctx, `UPDATE shares SET revoked_at=COALESCE(revoked_at,clock_timestamp()),updated_at=clock_timestamp() WHERE user_id=$1 AND id::text=$2 AND `+visible, owner, id)
 	if err != nil {
 		return err
 	}
@@ -187,7 +230,7 @@ func (s Store) Redeem(ctx context.Context, token string) (Public, error) {
 	}
 	defer tx.Rollback(ctx)
 	// PostgreSQL rechecks this predicate after waiting for any concurrent row lock.
-	err = tx.QueryRow(ctx, `UPDATE shares SET redemption_count=redemption_count+1,updated_at=now() WHERE token_hash=$1 AND revoked_at IS NULL AND expires_at>clock_timestamp() AND (max_redemptions IS NULL OR redemption_count<max_redemptions) RETURNING type,title,text_content,expires_at,object_key,file_name,file_size,content_type`, Hash(token)).Scan(&p.Type, &p.Title, &text, &p.ExpiresAt, &key, &p.FileName, &p.FileSize, &p.ContentType)
+	err = tx.QueryRow(ctx, `UPDATE shares SET redemption_count=redemption_count+1,updated_at=now(),exhausted_at=CASE WHEN type='FILE' AND redemption_count+1=max_redemptions THEN clock_timestamp() ELSE exhausted_at END WHERE token_hash=$1 AND (type='TEXT' OR file_state='READY') AND revoked_at IS NULL AND expires_at>clock_timestamp() AND (max_redemptions IS NULL OR redemption_count<max_redemptions) RETURNING type,title,text_content,expires_at,object_key,file_name,file_size,content_type`, Hash(token)).Scan(&p.Type, &p.Title, &text, &p.ExpiresAt, &key, &p.FileName, &p.FileSize, &p.ContentType)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return p, ErrUnavailable
 	}
@@ -211,6 +254,11 @@ func (s Store) Redeem(ctx context.Context, token string) (Public, error) {
 		p.DownloadURL, err = s.Objects.PresignGet(ctx, *key, *p.FileName, ttl)
 		if err != nil {
 			return Public{}, errors.New("download unavailable")
+		}
+		// Record exhaustion after signing so a slow credential lookup cannot
+		// spend the download's retention grace before its URL is issued.
+		if _, err = tx.Exec(ctx, `UPDATE shares SET exhausted_at=clock_timestamp() WHERE token_hash=$1 AND type='FILE' AND max_redemptions IS NOT NULL AND redemption_count=max_redemptions`, Hash(token)); err != nil {
+			return Public{}, err
 		}
 	}
 	// No URL is returned until the transaction commits. Signing failure rolls back

@@ -7,6 +7,7 @@ import (
 	"os"
 	"secureshare/api/internal/shares"
 	"secureshare/api/internal/storage"
+	"secureshare/api/internal/uploads"
 	"strconv"
 	"time"
 )
@@ -22,10 +23,10 @@ func fileUpload(s shares.Store) http.HandlerFunc {
 			return
 		}
 		var file *os.File
+		var remove func()
 		defer func() {
-			if file != nil {
-				file.Close()
-				_ = os.Remove(file.Name())
+			if remove != nil {
+				remove()
 			}
 		}()
 		fields := map[string]string{}
@@ -48,7 +49,7 @@ func fileUpload(s shares.Store) http.HandlerFunc {
 					return
 				}
 				name, kind = part.FileName(), part.Header.Get("Content-Type")
-				file, err = os.CreateTemp("", "secureshare-upload-*")
+				file, remove, err = uploads.Create(s.TempDir)
 				if err != nil {
 					part.Close()
 					fail(w, 500, "Upload unavailable")

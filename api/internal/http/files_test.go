@@ -16,6 +16,7 @@ import (
 	"secureshare/api/internal/database"
 	"secureshare/api/internal/shares"
 	"secureshare/api/internal/storage"
+	"secureshare/api/internal/uploads"
 	"secureshare/api/internal/users"
 	"strings"
 	"sync"
@@ -80,6 +81,12 @@ func TestFileIntegration(t *testing.T) {
 		t.Skip("TEST_DATABASE_URL required")
 	}
 	scratch := t.TempDir()
+	if err := os.Chmod(scratch, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := uploads.Ensure(scratch); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("TMPDIR", scratch)
 	t.Setenv("TMP", scratch)
 	t.Setenv("TEMP", scratch)
@@ -107,7 +114,7 @@ func TestFileIntegration(t *testing.T) {
 		_, _ = db.Exec(ctx, "DELETE FROM users WHERE id=$1 OR id=$2", owner.ID, other.ID)
 	}()
 	objects := &fakeObjects{}
-	store := shares.Store{DB: db, Objects: objects}
+	store := shares.Store{DB: db, Objects: objects, TempDir: scratch}
 	a := auth.New(config.Config{Origin: "http://localhost:3000", Secret: strings.Repeat("s", 32)}, us)
 	handler := Router(a, store)
 	call := func(method, path, who string, body io.Reader, contentType string) *httptest.ResponseRecorder {
@@ -331,6 +338,26 @@ func TestFileIntegration(t *testing.T) {
 			t.Fatal("revocation deleted object")
 		}
 	})
+	for _, state := range []string{"PENDING", "PURGED"} {
+		t.Run(strings.ToLower(state)+"_generic_unavailable", func(t *testing.T) {
+			v := create("")
+			query := `UPDATE shares SET file_state=$2 WHERE id=$1`
+			if state == "PURGED" {
+				query = `UPDATE shares SET file_state=$2,file_purged_at=now() WHERE id=$1`
+			}
+			if _, err := db.Exec(ctx, query, v.Share.ID, state); err != nil {
+				t.Fatal(err)
+			}
+			unavailable(v)
+			if state == "PENDING" {
+				if call("GET", "/shares/"+v.Share.ID, owner.ID, nil, "").Code != 404 || strings.Contains(call("GET", "/shares", owner.ID, nil, "").Body.String(), v.Share.ID) {
+					t.Fatal("pending exposed")
+				}
+			} else if !strings.Contains(call("GET", "/shares/"+v.Share.ID, owner.ID, nil, "").Body.String(), `"fileAvailable":false`) {
+				t.Fatal("purged history missing")
+			}
+		})
+	}
 	t.Run("atomic_one_time", func(t *testing.T) {
 		v := create("1")
 		start := make(chan struct{})
@@ -372,20 +399,19 @@ func TestFileIntegration(t *testing.T) {
 			t.Fatal("storage failure created row")
 		}
 	})
-	t.Run("db_failure_cleanup", func(t *testing.T) {
-		before := objects.deletes
+	t.Run("pending_insert_failure_no_upload", func(t *testing.T) {
+		before, puts := objects.deletes, objects.puts
 		created, err := store.CreateFile(ctx, "00000000-0000-0000-0000-000000000000", shares.FileInput{ExpiresAt: time.Now().Add(time.Hour), FileName: "file", Size: 1, Body: strings.NewReader("x")})
-		if err == nil || created.Token != "" || objects.deletes != before+1 {
-			t.Fatal("failed DB write did not clean up")
-		}
-		if _, exists := objects.bodies[objects.lastKey]; exists {
-			t.Fatal("orphan not deleted")
+		if err == nil || created.Token != "" || objects.deletes != before || objects.puts != puts {
+			t.Fatal("failed pending insertion uploaded an object")
 		}
 	})
 	t.Run("cleanup_failure_no_token", func(t *testing.T) {
 		objects.deleteErr = true
-		created, err := store.CreateFile(ctx, "00000000-0000-0000-0000-000000000000", shares.FileInput{ExpiresAt: time.Now().Add(time.Hour), FileName: "file", Size: 1, Body: strings.NewReader("x")})
+		objects.putErr = true
+		created, err := store.CreateFile(ctx, owner.ID, shares.FileInput{ExpiresAt: time.Now().Add(time.Hour), FileName: "file", Size: 1, Body: strings.NewReader("x")})
 		objects.deleteErr = false
+		objects.putErr = false
 		if err == nil || created.Token != "" {
 			t.Fatal("cleanup failure returned token")
 		}

@@ -1,6 +1,14 @@
-# Phase 2 validation — 2026-10-06
+# Phase 3 validation — 2026-10-06
 
-Implemented from clean HEAD **7d6e32c7a6537302f9cf2e4264e8e9b8bf8b4ba9**. All changes are under `secureshare/`; sibling projects were not modified. HEAD remains at that commit. No commit or push was performed. Migration 001 is unchanged.
+Implemented from clean HEAD **2da7525ac4a57ed4c9ce332684a2151fcb462f3e**. All changes are under `secureshare/`; sibling projects were not modified. Migrations 001 and 002 are unchanged, including SHA-256 checks in the migration suite. No commit or push was performed.
+
+## Implementation
+
+Migration **003_file_lifecycle.sql** introduces FILE PENDING → READY → PURGED, nullable purge/exhaustion timestamps, CHECK constraints and partial cleanup indexes. Existing FILE rows become READY; TEXT remains unchanged. Uploads persist PENDING before Put and hold a row lock during upload/finalization. Tokens are returned only after READY commits. Failed or ambiguous uploads/finalization use independently bounded cleanup; unsuccessful deletion retains the recovery row. An uncertain READY commit never triggers deletion of a committed READY object.
+
+The separate worker uses the existing storage interface and no public port. PostgreSQL session advisory locking uses a pinned pool connection; per-record transactions use SKIP LOCKED. Failed or uncertain lock acknowledgements discard the connection. Stale PENDING objects are deleted before their rows. Terminal READY objects are deleted after grace, then marked PURGED; metadata and internal keys remain. Failed DB persistence retries an idempotent Delete. No bucket listing. Defaults: interval 1m, retention 15m (validated >=60s), pending/spool grace 1h.
+
+The shared Unix spool checks ownership/modes, uses random 0600 files inside a 0700 directory, and removes files immediately on handled request exits. Confined, nonrecursive worker cleanup skips symlinks and unrelated entries. Non-Unix spooling fails closed; Windows development uses the Linux Compose services. Creator APIs hide PENDING and expose only derived FILE `fileAvailable`; the dashboard adds “Stored file removed” to retained history.
 
 ## Checks performed
 
@@ -8,75 +16,66 @@ Implemented from clean HEAD **7d6e32c7a6537302f9cf2e4264e8e9b8bf8b4ba9**. All ch
 |---|---|
 | `go fmt ./...` | Passed using Docker Go 1.26 |
 | `go vet ./...` | Passed |
-| `go test -race ./...` | Passed; PostgreSQL integration tests enabled |
+| `go test -race -count=1 -json ./...` | Passed; dedicated PostgreSQL database; 159 leaf cases, zero failures |
 | `go build ./cmd/server` | Passed |
+| `go build ./cmd/worker` | Passed |
+| `govulncheck ./...` | No vulnerabilities found |
 | `npm run lint` | Passed |
 | `npm run build` | Passed; Next.js 16.3.8 production build and TypeScript checks |
-| `govulncheck ./...` | No vulnerabilities found, including added AWS SDK Go v2 modules |
-| PostgreSQL 16 / Redis 7 / MinIO / API | Running; PostgreSQL healthy, API `/health` returned `ok`, MinIO readiness returned 200 |
-| Web | Production server running at `http://localhost:3000` |
-| Chrome acceptance / desktop and mobile | Passed; screenshots inspected |
-| Git diff check | Passed; migration 001 unchanged; no commit/push |
+| PostgreSQL / Redis / MinIO / API / web | Booted locally; API and MinIO health checks passed |
+| Continuous worker / SIGTERM / `--once` | Passed; clean shutdown; successful one-shot sweeps |
+| Real MinIO lifecycle / Chrome desktop and mobile | Passed; screenshots inspected |
+| Git diff / HEAD / migration hashes | Passed; 001/002 unchanged; no sibling changes, commit or push |
 
 ## Backend coverage
 
-**98 leaf cases across 11 top-level test functions; zero failures.** The final test invocation used `-race -json` to count individual cases, against the dedicated `secureshare_test` database.
+**159 leaf cases across 17 top-level test functions**, counted from the final uncached `-race -json` run.
 
 | Area | Leaf cases |
 |---|---|
 | Authentication regression | 4 |
 | Token / TEXT validation regression | 14 |
-| Phase 1 migration upgrade / FILE constraints | 11 |
-| Storage / filename / content type / SDK signing | 18 |
-| HTTP TEXT regression | 14 |
-| HTTP FILE upload / ownership / redemption / failure lifecycle | 37 |
-| Total | 98 |
+| Migration upgrades, unchanged hashes and FILE/lifecycle constraints | 30 |
+| Storage / safe metadata / SDK signing regression | 18 |
+| HTTP TEXT / FILE regressions and generic PENDING/PURGED responses | 53 |
+| Creation lifecycle / cleanup retention, retries and coordination | 28 |
+| Worker defaults / duration validation | 8 |
+| Private spool / stale-file and symlink safety | 4 |
+| Total | 159 |
 
-Migration tests build an isolated schema from unchanged migration 001, insert an existing TEXT row, apply migration 002, verify preservation/idempotence and valid FILE state, and reject mixed states and invalid metadata/size. FILE upload tests include the exact 25 MiB boundary, oversize with unknown Content-Length, empty/multiple/missing files, invalid fields, duplicate fields, invalid expiry/limits, safe metadata, hash-only token storage, and independently random object keys. Temporary upload files are checked for cleanup after handled successes/failures.
+Lifecycle tests use isolated PostgreSQL schemas and fake storage. They cover durable PENDING before Put; hidden creator metadata; READY before token; failed insertion with no upload; ambiguous Put and failed READY finalization with successful/failed cleanup; and independent cancellation cleanup. Cleanup tests cover fresh/stale PENDING, active limited/unlimited files, expiry/revocation/exhaustion before/after grace, missing objects, storage retry, DB failure after successful Delete for both PENDING and READY, retained history, idempotence, final redemption grace and stable exhaustion timestamps. Coordination tests block one sweep and verify another skips, protect active upload row locks, and check released advisory locks in `pg_locks` after normal completion/cancellation.
 
-Failure tests cover storage upload error → no row, database insertion error → best-effort object deletion, cleanup failure → no token returned, and signing failure → redemption count rollback. Revoke tests verify no underlying object deletion. Creator list/detail/foreign-owner checks verify safe serialization and ownership. URL material and raw share tokens are not persisted.
+Existing FILE and TEXT one-time HTTP races still produce exactly one 200 and one generic 404 against real PostgreSQL, stored count 1 and subsequent unavailable. FILE signing failure rolls back the count. Adapter tests use local httptest endpoints and explicit fake credentials. Tests never call public internet; vulnerability scanning/dependency tooling uses network access.
 
-The **FILE and TEXT one-time concurrency tests** each submit two simultaneous POST redemptions against real PostgreSQL: exactly one returns 200, the other generic 404, count remains 1, and another redemption is unavailable. FILE signing occurs exactly once. GET endpoints do not consume a share. Revoked, expired, exhausted and unknown states use the same generic response.
+## Real private MinIO acceptance
 
-The AWS SDK adapter is tested against a local httptest HTTP server with explicit fake credentials. Tests verify octet-stream/attachment storage, 60-second signing TTL, browser-facing signing host, safe Content-Disposition, no-store, and rejection of excessive TTL. Most file tests use fake object storage. Tests never call public internet; only dependency installation and vulnerability scanning use network access.
-
-## Real MinIO browser acceptance
-
-Headless Chrome exercised the production Next.js frontend, running Go API, PostgreSQL, and **real private MinIO**. A temporary local user received a test-issued signed session; no authentication bypass was added to the app.
+Headless Chrome exercised the production frontend, Go API, PostgreSQL and real local MinIO. A temporary local user received a test-issued signed session; no application authentication bypass or lifecycle/timestamp mutation endpoint was added.
 
 Passed:
 
-1. Select FILE, upload HTML-shaped content containing non-UTF-8 binary bytes, create a one-time share and copy its capability URL using the clipboard.
-2. Open an independent logged-out browser context. Landing page sends no redemption request and the database count remains 0.
-3. Click Download private file. POST returns metadata and a signed URL; the file downloads with sanitized filename `evil_report.html`. Downloaded bytes exactly match uploaded bytes, including binary data preserved by the streaming proxy.
-4. Verify `Content-Type: application/octet-stream`, `Content-Disposition: attachment`, and `Cache-Control: no-store`. Script-like file content does not execute in the share page.
-5. Verify signed URL `X-Amz-Expires=60`, no capability token in that URL, and no standalone objectKey/tokenHash/userId response fields.
-6. Fetch the same object without its signature: **403**. Anonymous bucket access: **403**.
-7. Refresh and explicitly redeem again: generic Share not available. Creator Refresh shows **1 / 1**, Exhausted.
-8. Refresh creator dashboard: raw capability URL is gone. FILE/TEXT type, filename and human-readable size are displayed.
-9. Create and redeem a one-time TEXT share after the POST refactor: literal text displays, script-like text does not execute, and second redemption is unavailable.
-10. Inspect desktop/mobile layouts. Temporary browser test rows and MinIO objects are removed after the check.
+1. Create a one-time FILE through the UI; verify READY in PostgreSQL; copy capability URL to clipboard.
+2. Open an independent logged-out browser context; no redemption on load, count remains zero.
+3. Explicitly download HTML-shaped content containing non-UTF-8 bytes. Bytes match exactly; sanitized filename is `evil_report.html`; file content never executes in the share page.
+4. Verify octet-stream, attachment, no-store and a 60-second URL. Unsigned object and anonymous bucket requests return 403. Response has no standalone keys/hashes/owner/lifecycle fields.
+5. Exhaustion records its timestamp. Run `--once` before grace: row stays READY and the same signed URL still downloads.
+6. Age only the temporary owner's exhaustion timestamp beyond 15m. Run `--once`: row becomes PURGED with timestamp/key retained; the still-signed request returns **404 NoSuchKey**. Unsigned access stays 403. Repeated sweep purges zero objects.
+7. Refresh creator UI: historical filename/size, **1 / 1**, Exhausted and **Stored file removed** remain; raw capability URL is gone. Public redemption is generic Share not available.
+8. Build an owner-scoped stale PENDING fixture from a real uploaded object, confirming a working signed download before fixture mutation. Creator list/detail hide PENDING and public redemption gives generic 404. One sweep deletes the object and PENDING row; previously signed request returns **404 NoSuchKey**.
+9. Create a stale generated spool filename in the shared API volume; the worker removes it, verified from the API container.
+10. Create/redeem a one-time TEXT through the UI; literal script-like text displays safely; second redemption is unavailable. Inspect desktop/mobile layouts with retained history and removed-file indication.
 
-Secret capability tokens, session material and presigned URLs are withheld from console output. Screenshots do not show live URL material.
+Fixture mutations affected only temporary test rows. Test users/rows and objects were removed afterward. Tokens, sessions, keys and presigned URLs were withheld from console output and screenshots. Initial acceptance teardown attempted to remove an already-purged object; the harness was corrected to skip PURGED objects, and the complete acceptance rerun exited successfully.
 
-**Real GitHub sign-in has not been manually verified:** local client credentials remain empty. Configure your OAuth App and run the README acceptance steps for interactive authorization. Existing OAuth regression tests use a local mock server. AWS S3/R2 live deployment has not been tested; their compatibility comes from the configurable AWS SDK v2 adapter and still needs provider-specific deployment verification.
-
-## Local MinIO build
-
-Docker Hub and Quay pulls for official MinIO/mc images failed during validation. Compose therefore builds official pinned upstream sources via `infra/minio/Dockerfile`:
-
-- MinIO `RELEASE.2025-09-07T16-13-09Z`, resolved commit `07c3a429bfed433e49018cb0f78a52145d4bedeb`.
-- mc `RELEASE.2025-08-13T08-35-41Z`, resolved commit `7394ce0dd2a80935aded936b09fa12cbb3cb8096`.
-
-The local image runs as an unprivileged user. Initialization created `secureshare-local` and set anonymous access to none. Credentials and loopback bindings are explicitly development-only. This older pinned community source build is local infrastructure, not a production deployment recommendation.
+**Real GitHub authorization remains unverified:** local credentials are empty; local mock OAuth regressions pass. Live AWS S3/R2 deployment and provider-specific versioning/retention/Delete semantics have not been validated.
 
 ## Remaining limitations
 
-- One-time means one successful redemption. The signed download URL is reusable for at most 60 seconds (capped by share lifetime when issued). Immediate revoke prevents future redemptions but cannot revoke an already issued URL. A started transfer may finish after expiration.
-- Object upload and DB creation are not a distributed transaction. Crashes, ambiguous commits and failed best-effort cleanup can leave inaccessible orphan objects. Retention/reconciliation and stale temporary-file cleanup after abrupt crashes remain Phase 3 work. Revocation deliberately retains objects.
-- Response/download failures after the committed redemption consume the access. Signing failures before commit roll it back.
-- No malware scanning, rate limiting/audit, production deployment, or provider-specific live S3/R2 validation yet. Files are always forced to download; recipients still need to assess downloaded content before opening it locally.
-- Existing latest-200 listing, sessions without server-side revocation registry, plaintext storage and baseline CSP permitting inline framework scripts/styles remain.
-- The Phase 1 frontend tooling dependency issue remains: five high-severity dev-tool entries stem from the [braces advisory](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm) through Next's ESLint dependency chain. Frontend dependencies were not changed in Phase 2; the previous production npm audit reported zero vulnerabilities. No breaking downgrade of the Next.js 16 ESLint config was applied.
+- PostgreSQL and storage are not a distributed transaction. Recovery is eventual; crashes and ambiguous late remote operations prevent an exactly-once guarantee. READY can commit before token delivery; that visible share's secret cannot be recovered.
+- Issued URLs are reusable until expiry. Revocation blocks future redemptions; physical cleanup waits for grace. A started transfer may finish. Response/download failures after commit consume the access.
+- Contents remain plaintext unless provider encryption at rest is configured; this is not end-to-end encryption. Historical metadata has no automatic retention policy. Sweeps handle up to 200 candidates.
+- Spooling requires Unix ownership/mode guarantees; use Docker on Windows. API and worker need the same UID/shared directory. Advisory locks require session-stable PostgreSQL connections, not transaction pooling.
+- No rate limiting/audit/abuse controls, malware scanning or production deployment. Latest-200 listing, sessions without a revocation registry and baseline inline framework CSP remain.
+- Frontend dependencies are unchanged. The previously documented five high-severity dev-tool entries from the [braces advisory](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm) remain; prior production npm audit reported zero vulnerabilities. No breaking ESLint downgrade was applied.
+- Local MinIO remains the Phase 2 pinned upstream source build (`RELEASE.2025-09-07T16-13-09Z`, mc `RELEASE.2025-08-13T08-35-41Z`), with private bucket and development-only credentials. It is not a production recommendation.
 
-Roadmap: Phase 3 lifecycle/cleanup; Phase 4 rate limiting/audit; Phase 5 production deployment/polish.
+Phase 4: rate limiting / audit / abuse protection. Phase 5: production deployment / provider validation / polish, including an independent private Coolify worker.
