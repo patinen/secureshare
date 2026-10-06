@@ -12,6 +12,7 @@ import (
 	"secureshare/api/internal/database"
 	apihttp "secureshare/api/internal/http"
 	"secureshare/api/internal/shares"
+	"secureshare/api/internal/storage"
 	"secureshare/api/internal/users"
 	"syscall"
 	"time"
@@ -35,7 +36,11 @@ func main() {
 	if err = database.Migrate(ctx, db); err != nil {
 		log.Fatal("database migration failed")
 	}
-	server := &http.Server{Addr: ":" + c.Port, Handler: apihttp.Router(auth.New(c, users.Store{DB: db}), shares.Store{DB: db}), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
+	objects, err := storage.New(ctx, c.Storage)
+	if err != nil {
+		log.Fatal("storage configuration failed")
+	}
+	server := &http.Server{Addr: ":" + c.Port, Handler: apihttp.Router(auth.New(c, users.Store{DB: db}), shares.Store{DB: db, Objects: objects}), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 120 * time.Second, WriteTimeout: 150 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)

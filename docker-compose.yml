@@ -16,6 +16,29 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["127.0.0.1:56379:6379"]
+  minio:
+    image: secureshare-minio-local:2025-09-07
+    build: ./infra/minio
+    command: server /data --console-address :9001
+    environment:
+      # Local development only; never deploy these credentials.
+      MINIO_ROOT_USER: secureshare_local
+      MINIO_ROOT_PASSWORD: local_storage_development_only
+    ports: ["127.0.0.1:59000:9000", "127.0.0.1:59001:9001"]
+    volumes: ["minio_data:/data"]
+  minio-init:
+    image: secureshare-minio-local:2025-09-07
+    build: ./infra/minio
+    depends_on: [minio]
+    environment:
+      MC_HOST_local: http://secureshare_local:local_storage_development_only@minio:9000
+    entrypoint: /bin/sh
+    command:
+      - -ec
+      - |
+        until mc ready local >/dev/null 2>&1; do sleep 1; done
+        mc mb --ignore-existing local/secureshare-local
+        mc anonymous set none local/secureshare-local
   api:
     image: golang:1.26-bookworm
     working_dir: /app
@@ -24,11 +47,16 @@ services:
     env_file: ./api/.env
     environment:
       DATABASE_URL: postgres://secureshare_local:local_development_only@postgres:5432/secureshare_local?sslmode=disable
+      S3_ENDPOINT: http://minio:9000
+      S3_DOWNLOAD_ENDPOINT: http://localhost:59000
     ports: ["127.0.0.1:8080:8080"]
     depends_on:
       postgres:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
 volumes:
   postgres_data:
   go_modules:
   go_build:
+  minio_data:

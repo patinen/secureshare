@@ -118,7 +118,7 @@ func TestIntegration(t *testing.T) {
 		}
 	})
 	t.Run("public_safe_content", func(t *testing.T) {
-		r := call("GET", "/public/shares/"+c.Token, "", nil)
+		r := call("POST", "/public/shares/"+c.Token+"/redeem", "", nil)
 		var content map[string]any
 		_ = json.Unmarshal(r.Body.Bytes(), &content)
 		if r.Code != 200 || len(content) != 4 || content["text"] != "<script>alert('plain text')</script>" {
@@ -131,7 +131,7 @@ func TestIntegration(t *testing.T) {
 		}
 	})
 	t.Run("unknown", func(t *testing.T) {
-		r := call("GET", "/public/shares/"+strings.Repeat("a", 43), "", nil)
+		r := call("POST", "/public/shares/"+strings.Repeat("a", 43)+"/redeem", "", nil)
 		if r.Code != 404 || r.Body.String() != "{\"error\":\"Share not available\"}\n" {
 			t.Fatal(r.Body.String())
 		}
@@ -140,7 +140,7 @@ func TestIntegration(t *testing.T) {
 		if call("DELETE", "/shares/"+c.Share.ID, owner.ID, nil).Code != 204 {
 			t.Fatal("revoke failed")
 		}
-		if call("GET", "/public/shares/"+c.Token, "", nil).Code != 404 {
+		if call("POST", "/public/shares/"+c.Token+"/redeem", "", nil).Code != 404 {
 			t.Fatal("revoked share available")
 		}
 	})
@@ -150,7 +150,7 @@ func TestIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if call("GET", "/public/shares/"+expired.Token, "", nil).Code != 404 {
+		if call("POST", "/public/shares/"+expired.Token+"/redeem", "", nil).Code != 404 {
 			t.Fatal("expired share available")
 		}
 	})
@@ -162,7 +162,11 @@ func TestIntegration(t *testing.T) {
 		var wg sync.WaitGroup
 		for i := 0; i < 2; i++ {
 			wg.Add(1)
-			go func() { defer wg.Done(); <-start; codes <- call("GET", "/public/shares/"+c.Token, "", nil).Code }()
+			go func() {
+				defer wg.Done()
+				<-start
+				codes <- call("POST", "/public/shares/"+c.Token+"/redeem", "", nil).Code
+			}()
 		}
 		close(start)
 		wg.Wait()
@@ -185,7 +189,7 @@ func TestIntegration(t *testing.T) {
 		if err := db.QueryRow(ctx, "SELECT redemption_count FROM shares WHERE id=$1", c.Share.ID).Scan(&count); err != nil || count != 1 {
 			t.Fatal("count exceeded limit")
 		}
-		if call("GET", "/public/shares/"+c.Token, "", nil).Code != 404 {
+		if call("POST", "/public/shares/"+c.Token+"/redeem", "", nil).Code != 404 {
 			t.Fatal("exhausted share available")
 		}
 	})

@@ -1,9 +1,13 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useRouter } from "next/navigation";
 import LoginButton from "../login-button";
+import { fileSize } from "../format";
 type Share = {
   id: string;
+  type: "TEXT" | "FILE";
+  fileName?: string;
+  fileSize?: number;
   title: string | null;
   createdAt: string;
   expiresAt: string;
@@ -33,6 +37,9 @@ function status(s: Share) {
 }
 export default function Dashboard() {
   const router = useRouter();
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [type, setType] = useState<"TEXT" | "FILE">("TEXT"),
+    [file, setFile] = useState<File | null>(null);
   const [user, setUser] = useState<{ login: string } | null>(null),
     [ready, setReady] = useState(false),
     [list, setList] = useState<Share[]>([]),
@@ -74,24 +81,39 @@ export default function Dashboard() {
     setUrl("");
     setCopied(false);
     try {
-      if (new TextEncoder().encode(text).length > 102400)
+      if (type === "TEXT" && new TextEncoder().encode(text).length > 102400)
         throw new Error("Text must be at most 100 KB.");
-      const result = await api("/shares", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type: "TEXT",
-          title: title || null,
-          text,
-          expiresAt: new Date(
-            Date.now() + Number(hours) * 3600000,
-          ).toISOString(),
-          maxRedemptions: limit ? Number(limit) : null,
-        }),
-      });
+      const expiresAt = new Date(
+        Date.now() + Number(hours) * 3600000,
+      ).toISOString();
+      let result;
+      if (type === "FILE") {
+        if (!file || file.size === 0 || file.size > 25 * 1024 * 1024)
+          throw new Error("Select a non-empty file up to 25 MiB.");
+        const form = new FormData();
+        form.append("file", file);
+        if (title) form.append("title", title);
+        form.append("expiresAt", expiresAt);
+        if (limit) form.append("maxRedemptions", limit);
+        result = await api("/shares/file", { method: "POST", body: form });
+      } else {
+        result = await api("/shares", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "TEXT",
+            title: title || null,
+            text,
+            expiresAt,
+            maxRedemptions: limit ? Number(limit) : null,
+          }),
+        });
+      }
       setUrl(window.location.origin + "/s/" + result.token);
       setText("");
       setTitle("");
+      setFile(null);
+      if (fileRef.current) fileRef.current.value = "";
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unable to create share");
@@ -149,9 +171,20 @@ export default function Dashboard() {
       )}
       <div className="workspace">
         <section className="panel">
-          <h2>New text share</h2>
-          <p className="muted">A private message, with a clear end.</p>
+          <h2>{type === "TEXT" ? "New text share" : "New file share"}</h2>
+          <p className="muted">A private share, with a clear end.</p>
           <form onSubmit={create}>
+            <label>
+              Share type
+              <select
+                value={type}
+                onChange={(e) => setType(e.target.value as "TEXT" | "FILE")}
+                disabled={busy}
+              >
+                <option value="TEXT">Text share</option>
+                <option value="FILE">File share</option>
+              </select>
+            </label>
             <label>
               Title <span>optional</span>
               <input
@@ -160,20 +193,41 @@ export default function Dashboard() {
                 maxLength={150}
               />
             </label>
-            <label>
-              Text
-              <textarea
-                required
-                rows={9}
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                placeholder="What would you like to share?"
-              />
-            </label>
-            <small>
-              {new TextEncoder().encode(text).length.toLocaleString()} / 102,400
-              bytes
-            </small>
+            {type === "TEXT" ? (
+              <>
+                <label>
+                  Text
+                  <textarea
+                    required
+                    rows={9}
+                    value={text}
+                    onChange={(e) => setText(e.target.value)}
+                    placeholder="What would you like to share?"
+                  />
+                </label>
+                <small>
+                  {new TextEncoder().encode(text).length.toLocaleString()} /
+                  102,400 bytes
+                </small>
+              </>
+            ) : (
+              <>
+                <label>
+                  File
+                  <input
+                    ref={fileRef}
+                    type="file"
+                    required
+                    onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                  />
+                </label>
+                <small>
+                  {file
+                    ? `${file.name} · ${fileSize(file.size)}`
+                    : "Select one file · Maximum 25 MiB"}
+                </small>
+              </>
+            )}
             <div className="fields">
               <label>
                 Expires in
@@ -269,6 +323,7 @@ export default function Dashboard() {
               <thead>
                 <tr>
                   <th>Share</th>
+                  <th>Type</th>
                   <th>Created</th>
                   <th>Expires</th>
                   <th>Accesses</th>
@@ -279,7 +334,15 @@ export default function Dashboard() {
               <tbody>
                 {list.map((s) => (
                   <tr key={s.id}>
-                    <td>{s.title || "Untitled share"}</td>
+                    <td>
+                      {s.title || "Untitled share"}
+                      {s.type === "FILE" && (
+                        <div className="muted">
+                          {s.fileName} · {fileSize(s.fileSize ?? 0)}
+                        </div>
+                      )}
+                    </td>
+                    <td>{s.type}</td>
                     <td>{new Date(s.createdAt).toLocaleString()}</td>
                     <td>{new Date(s.expiresAt).toLocaleString()}</td>
                     <td>

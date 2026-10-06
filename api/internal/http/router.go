@@ -59,7 +59,7 @@ func Router(a *auth.Auth, s shares.Store) http.Handler {
 		}
 		write(w, 200, u)
 	})
-	r.Get("/public/shares/{token}", func(w http.ResponseWriter, r *http.Request) {
+	r.Post("/public/shares/{token}/redeem", func(w http.ResponseWriter, r *http.Request) {
 		token := chi.URLParam(r, "token")
 		if len(token) != 43 {
 			fail(w, 404, "Share not available")
@@ -87,6 +87,7 @@ func Router(a *auth.Auth, s shares.Store) http.Handler {
 				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, u)))
 			})
 		})
+		r.Post("/file", fileUpload(s))
 		r.Post("/", func(w http.ResponseWriter, r *http.Request) {
 			u := currentUser(r)
 			var in shares.Input

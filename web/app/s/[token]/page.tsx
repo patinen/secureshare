@@ -1,9 +1,13 @@
 "use client";
 import { use, useRef, useState } from "react";
+import { fileSize } from "../../format";
 type Content = {
   type: string;
   title: string | null;
-  text: string;
+  text?: string;
+  fileName?: string;
+  fileSize?: number;
+  downloadUrl?: string;
   expiresAt: string;
 };
 export default function PublicShare({
@@ -21,9 +25,13 @@ export default function PublicShare({
     started.current = true;
     setBusy(true);
     try {
-      const r = await fetch("/api/public/shares/" + encodeURIComponent(token), {
-        cache: "no-store",
-      });
+      const r = await fetch(
+        "/api/public/shares/" + encodeURIComponent(token) + "/redeem",
+        {
+          method: "POST",
+          cache: "no-store",
+        },
+      );
       if (!r.ok) {
         setError(
           r.status === 404
@@ -32,7 +40,17 @@ export default function PublicShare({
         );
         return;
       }
-      setContent(await r.json());
+      const result: Content = await r.json();
+      setContent(result);
+      if (result.type === "FILE" && result.downloadUrl) {
+        const link = document.createElement("a");
+        link.href = result.downloadUrl;
+        link.download = result.fileName ?? "download";
+        link.rel = "noreferrer";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      }
     } catch {
       setError("Unable to open share. Please try again later.");
     } finally {
@@ -44,8 +62,33 @@ export default function PublicShare({
       <div className="eyebrow">A PRIVATE DELIVERY</div>
       {content ? (
         <>
-          <h1>{content.title || "A message for you"}</h1>
-          <pre className="textcontent">{content.text}</pre>
+          <h1>
+            {content.title ||
+              (content.type === "FILE"
+                ? "A file for you"
+                : "A message for you")}
+          </h1>
+          {content.type === "TEXT" ? (
+            <pre className="textcontent">{content.text}</pre>
+          ) : (
+            <>
+              <p>
+                {content.fileName} · {fileSize(content.fileSize ?? 0)}
+              </p>
+              <p className="muted">
+                Your download has been requested. This download link expires
+                within 60 seconds; it may be reused during that window.
+              </p>
+              <a
+                className="button"
+                href={content.downloadUrl}
+                rel="noreferrer"
+                download={content.fileName}
+              >
+                Download file again
+              </a>
+            </>
+          )}
           <p className="muted">
             Expires {new Date(content.expiresAt).toLocaleString()}. This access
             has been counted.
@@ -61,13 +104,16 @@ export default function PublicShare({
         </>
       ) : (
         <>
-          <h1>A message for you.</h1>
+          <h1>A private share for you.</h1>
           <p>
-            Opening this share counts as one access. A one-time message will be
+            Opening this share counts as one access. A one-time share will be
             unavailable after you leave or refresh.
           </p>
           <button className="button" disabled={busy} onClick={open}>
             {busy ? "Opening…" : "Open private message →"}
+          </button>
+          <button className="secondary" disabled={busy} onClick={open}>
+            {busy ? "Opening…" : "Download private file"}
           </button>
         </>
       )}

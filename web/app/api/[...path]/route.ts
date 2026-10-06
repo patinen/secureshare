@@ -18,15 +18,37 @@ async function proxy(
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }
+  const maxBytes =
+    path[0] === "shares" && path[1] === "file"
+      ? 25 * 1024 * 1024 + 64 * 1024
+      : 700000;
+  let bytes = 0;
+  const body = request.body?.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        bytes += chunk.byteLength;
+        if (bytes > maxBytes) {
+          controller.error(new Error("Request too large"));
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+    }),
+  );
   try {
-    const upstream = await fetch(target, {
+    const options: RequestInit & { duplex: "half" } = {
       method: request.method,
       headers,
-      body: request.method === "GET" ? undefined : await request.text(),
+      body:
+        request.method === "GET" || request.method === "HEAD"
+          ? undefined
+          : body,
+      duplex: "half",
       redirect: "manual",
       cache: "no-store",
-      signal: AbortSignal.timeout(25000),
-    });
+      signal: AbortSignal.timeout(150000),
+    };
+    const upstream = await fetch(target, options);
     const outgoing = new Headers({
       "Cache-Control": "no-store",
       "Referrer-Policy": "no-referrer",
@@ -43,8 +65,16 @@ async function proxy(
     });
   } catch {
     return Response.json(
-      { error: "Service unavailable" },
-      { status: 502, headers: { "Cache-Control": "no-store" } },
+      {
+        error:
+          bytes > maxBytes
+            ? "Upload exceeds size limit"
+            : "Service unavailable",
+      },
+      {
+        status: bytes > maxBytes ? 413 : 502,
+        headers: { "Cache-Control": "no-store" },
+      },
     );
   }
 }
