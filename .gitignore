@@ -1,0 +1,11 @@
+.env
+.env.local
+.env.*
+!.env.example
+node_modules/
+.next/
+api/server
+api/server.exe
+*.log
+.validation/
+web/tsconfig.tsbuildinfo
