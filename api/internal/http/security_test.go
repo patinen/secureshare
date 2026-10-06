@@ -55,7 +55,7 @@ func TestHTTPProtection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := auth.New(config.Config{Origin: "http://localhost:3000", Secret: strings.Repeat("s", 32), ClientID: "local", ClientSecret: "local"}, us)
+	a := auth.New(config.Config{Origin: "http://localhost:3000", ClientID: "local", ClientSecret: "local"}, us)
 	s := shares.Store{DB: db, Objects: &fakeObjects{}, TempDir: t.TempDir() + "/uploads"}
 	lim := &policyLimiter{seen: map[string]int{}, max: 1}
 	var logs bytes.Buffer
@@ -73,7 +73,7 @@ func TestHTTPProtection(t *testing.T) {
 		r.Header.Set("X-Request-ID", "attacker-supplied")
 		r.Header.Set("X-Forwarded-For", "203.0.113.99")
 		if who != "" {
-			r.AddCookie(&http.Cookie{Name: "session", Value: a.Issue(who)})
+			r.AddCookie(&http.Cookie{Name: a.CookieName("session"), Value: testSession(t, a, who)})
 		}
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, r)
@@ -263,14 +263,15 @@ func TestAuthAuditHTTP(t *testing.T) {
 		}
 	}))
 	defer github.Close()
-	a := auth.New(config.Config{Origin: "http://localhost:3000", Secret: strings.Repeat("s", 32), ClientID: "local", ClientSecret: "local"}, users.Store{DB: db})
+	a := auth.New(config.Config{Origin: "http://localhost:3000", ClientID: "local", ClientSecret: "local"}, users.Store{DB: db})
 	a.TokenURL = github.URL + "/token"
 	a.ProfileURL = github.URL + "/user"
 	var logs bytes.Buffer
 	h := Router(a, shares.Store{DB: db}, Options{Limiter: allowAll{}, Logger: log.New(&logs, "", 0)})
 	callback := func() *httptest.ResponseRecorder {
 		r := httptest.NewRequest("GET", "/auth/github/callback?state="+strings.Repeat("a", 43)+"&code=oauth-private-code", nil)
-		r.AddCookie(&http.Cookie{Name: "oauth_state", Value: strings.Repeat("a", 43)})
+		r.AddCookie(&http.Cookie{Name: a.CookieName("oauth_state"), Value: strings.Repeat("a", 43)})
+		r.AddCookie(&http.Cookie{Name: a.CookieName("oauth_pkce"), Value: strings.Repeat("v", 43)})
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
 		return w
@@ -282,7 +283,7 @@ func TestAuthAuditHTTP(t *testing.T) {
 			t.Fatal("OAuth login failed")
 		}
 		for _, c := range w.Result().Cookies() {
-			if c.Name == "session" {
+			if c.Name == a.CookieName("session") {
 				session = c
 			}
 		}
@@ -320,7 +321,7 @@ func TestAuthAuditHTTP(t *testing.T) {
 			t.Fatal("audit outage ignored")
 		}
 		for _, c := range w.Result().Cookies() {
-			if c.Name == "session" {
+			if c.Name == a.CookieName("session") {
 				t.Fatal("session issued without audit")
 			}
 		}

@@ -296,3 +296,9 @@ select:focus-visible {
     display: none;
   }
 }
+
+.workspace > *, .panel { min-width: 0; }
+small, td:first-child, .public h1 { overflow-wrap: anywhere; }
+table { min-width: 850px; }
+td:first-child { min-width: 220px; max-width: 280px; }
+button:disabled { cursor: wait; opacity: .65; }

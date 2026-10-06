@@ -29,7 +29,7 @@ const activityLabels: Record<string, string> = {
 async function api(path: string, init?: RequestInit) {
   const r = await fetch("/api" + path, { ...init, cache: "no-store" });
   if (!r.ok) {
-    let message = "Request failed";
+    let message = r.status === 429 ? "Too many requests. Please wait and try again." : r.status === 413 ? "Upload or storage limit exceeded." : r.status === 503 ? "Service temporarily unavailable. Try again shortly." : "Request failed";
     try {
       message = (await r.json()).error || message;
     } catch {}
@@ -148,13 +148,15 @@ export default function Dashboard() {
     }
   }
   async function revoke(id: string) {
+    if (!window.confirm("Revoke this share? Future access will be blocked.")) return;
     setError("");
+    setBusy(true);
     try {
       await api("/shares/" + id, { method: "DELETE" });
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unable to revoke");
-    }
+    } finally { setBusy(false); }
   }
   if (!ready) return <p>Loading your workspace…</p>;
   if (!user)
@@ -175,7 +177,9 @@ export default function Dashboard() {
         </div>
         <button
           className="secondary"
+          disabled={busy}
           onClick={async () => {
+            setBusy(true);
             try {
               await api("/auth/logout", { method: "POST" });
               setUser(null);
@@ -185,7 +189,7 @@ export default function Dashboard() {
               router.replace("/");
             } catch {
               setError("Unable to sign out");
-            }
+            } finally { setBusy(false); }
           }}
         >
           Sign out
@@ -218,6 +222,7 @@ export default function Dashboard() {
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
                 maxLength={150}
+                disabled={busy}
               />
             </label>
             {type === "TEXT" ? (
@@ -228,6 +233,7 @@ export default function Dashboard() {
                     required
                     rows={9}
                     value={text}
+                    disabled={busy}
                     onChange={(e) => setText(e.target.value)}
                     placeholder="What would you like to share?"
                   />
@@ -244,6 +250,7 @@ export default function Dashboard() {
                   <input
                     ref={fileRef}
                     type="file"
+                    disabled={busy}
                     required
                     onChange={(e) => setFile(e.target.files?.[0] ?? null)}
                   />
@@ -260,6 +267,7 @@ export default function Dashboard() {
                 Expires in
                 <select
                   value={hours}
+                  disabled={busy}
                   onChange={(e) => setHours(e.target.value)}
                 >
                   <option value="1">1 hour</option>
@@ -275,6 +283,7 @@ export default function Dashboard() {
                   min="1"
                   max="1000"
                   value={limit}
+                  disabled={busy}
                   onChange={(e) => setLimit(e.target.value)}
                   placeholder="Unlimited"
                 />
@@ -314,6 +323,7 @@ export default function Dashboard() {
               >
                 {copied ? "Copied ✓" : "Copy link"}
               </button>
+              <p role="status" aria-live="polite">{copied ? "Secret link copied to clipboard." : ""}</p>
               <button className="quiet" onClick={() => setUrl("")}>
                 Dismiss link
               </button>
@@ -330,9 +340,8 @@ export default function Dashboard() {
           <h2>Your shares</h2>
           <button
             className="secondary"
-            onClick={() =>
-              refresh().catch(() => setError("Unable to refresh shares"))
-            }
+            disabled={busy}
+            onClick={async () => { setBusy(true); try { await refresh(); } catch { setError("Unable to refresh shares"); } finally { setBusy(false); } }}
           >
             Refresh
           </button>
@@ -385,7 +394,7 @@ export default function Dashboard() {
                     </td>
                     <td>
                       {!s.revokedAt && (
-                        <button className="quiet" onClick={() => revoke(s.id)}>
+                        <button className="quiet" disabled={busy} onClick={() => revoke(s.id)}>
                           Revoke
                         </button>
                       )}

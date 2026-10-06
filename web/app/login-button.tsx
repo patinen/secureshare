@@ -1,10 +1,5 @@
 export default function LoginButton() {
-  // A regular form navigation reaches OAuth without client prefetching.
-  return (
-    <form action="/api/auth/github" method="get">
-      <button className="button" type="submit">
-        Continue with GitHub ↗
-      </button>
-    </form>
-  );
+  // Native navigation has no Next prefetch and is not a CSP form submission.
+  // eslint-disable-next-line @next/next/no-html-link-for-pages -- OAuth API requires full browser navigation, not an RSC fetch.
+  return <a className="button" href="/api/auth/github">Continue with GitHub ↗</a>;
 }

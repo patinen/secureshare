@@ -36,7 +36,11 @@ export default function PublicShare({
         setError(
           r.status === 404
             ? "Share not available"
-            : "Unable to open share. Please try again later.",
+            : r.status === 429
+              ? "Too many requests. Please wait and try again."
+              : r.status === 503
+                ? "Service temporarily unavailable. Try again later."
+                : "Unable to open share. Please try again later.",
         );
         return;
       }
@@ -97,10 +101,7 @@ export default function PublicShare({
       ) : error ? (
         <>
           <h1>{error}</h1>
-          <p>
-            The link may have expired, been revoked, or reached its access
-            limit.
-          </p>
+          <p>{error === "Share not available" ? "The link may have expired, been revoked, or reached its access limit." : "Refresh and explicitly open the share when you are ready to retry."}</p>
         </>
       ) : (
         <>

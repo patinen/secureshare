@@ -1,3 +1,4 @@
+export const dynamic = "force-dynamic";
 import type { Metadata } from "next";
 import Link from "next/link";
 import "./globals.css";
@@ -20,7 +21,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         <main>{children}</main>
         <footer>
           Temporary text. Shared on your terms.{" "}
-          <span>Phase 2 · Text &amp; files</span>
+          <span>Text &amp; files</span>
         </footer>
       </body>
     </html>

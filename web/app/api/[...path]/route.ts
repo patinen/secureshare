@@ -1,3 +1,4 @@
+import { proxyHeaders } from "../../../lib/forwarding";
 import { NextRequest } from "next/server";
 export const dynamic = "force-dynamic";
 async function proxy(
@@ -10,15 +11,13 @@ async function proxy(
     path[0] === "auth" ||
     path[0] === "audit" ||
     (path[0] === "public" && path[1] === "shares");
-  if (!allowed) return new Response(null, { status: 404 });
+  const privacy = new Headers({ "Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow, noarchive" });
+  if (process.env.ENVIRONMENT === "production") privacy.set("Strict-Transport-Security", "max-age=31536000");
+  if (!allowed) return new Response(null, { status: 404, headers: privacy });
   const origin = process.env.API_ORIGIN || "http://localhost:8080";
   const target = new URL("/" + path.map(encodeURIComponent).join("/"), origin);
   target.search = request.nextUrl.search;
-  const headers = new Headers();
-  for (const name of ["cookie", "content-type", "origin"]) {
-    const value = request.headers.get(name);
-    if (value) headers.set(name, value);
-  }
+  const headers = proxyHeaders(request.headers, process.env.FORWARD_TRUSTED_PROXY_HEADERS);
   const maxBytes =
     path[0] === "shares" && path[1] === "file"
       ? 25 * 1024 * 1024 + 64 * 1024
@@ -50,12 +49,9 @@ async function proxy(
       signal: AbortSignal.timeout(150000),
     };
     const upstream = await fetch(target, options);
-    const outgoing = new Headers({
-      "Cache-Control": "no-store",
-      "Referrer-Policy": "no-referrer",
-    });
-    // Forward no browser-supplied client IP or request ID. Trusted edge
-    // forwarding needs an authenticated proxy chain established in Phase 5.
+    const outgoing = new Headers(privacy);
+    outgoing.set("Referrer-Policy", "no-referrer");
+    // Only safe response metadata; never forward incoming request IDs.
     for (const name of [
       "content-type",
       "location",
@@ -80,8 +76,8 @@ async function proxy(
             : "Service unavailable",
       },
       {
-        status: bytes > maxBytes ? 413 : 502,
-        headers: { "Cache-Control": "no-store" },
+        status: bytes > maxBytes ? 413 : 503,
+        headers: privacy,
       },
     );
   }

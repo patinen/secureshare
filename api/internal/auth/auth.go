@@ -2,7 +2,7 @@ package auth
 
 import (
 	"context"
-	"crypto/hmac"
+
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"secureshare/api/internal/config"
+	"secureshare/api/internal/sessions"
 	"secureshare/api/internal/shares"
 	"secureshare/api/internal/users"
 	"strings"
@@ -19,53 +20,49 @@ import (
 )
 
 type UserStore interface {
-	Upsert(context.Context, users.User) (users.User, error)
 	Get(context.Context, string) (users.User, error)
 }
 type Auth struct {
-	Auditor interface {
-		Record(context.Context, string, *string, string) error
+	Sessions interface {
+		Login(context.Context, users.User) (string, time.Time, error)
+		Lookup(context.Context, string) (string, error)
+		Revoke(context.Context, string) error
 	}
 	Config               config.Config
 	Users                UserStore
 	Client               *http.Client
 	TokenURL, ProfileURL string
 }
-type session struct {
-	ID      string `json:"id"`
-	Expires int64  `json:"expires"`
-}
 
 func New(c config.Config, u UserStore) *Auth {
-	return &Auth{Config: c, Users: u, Client: &http.Client{Timeout: 10 * time.Second}, TokenURL: "https://github.com/login/oauth/access_token", ProfileURL: "https://api.github.com/user"}
-}
-func (a *Auth) signature(payload string) string {
-	m := hmac.New(sha256.New, []byte(a.Config.Secret))
-	m.Write([]byte(payload))
-	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
-}
-func (a *Auth) Issue(id string) string {
-	b, _ := json.Marshal(session{ID: id, Expires: time.Now().Add(7 * 24 * time.Hour).Unix()})
-	p := base64.RawURLEncoding.EncodeToString(b)
-	return p + "." + a.signature(p)
-}
-func (a *Auth) Verify(token string) (string, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 2 || !hmac.Equal([]byte(a.signature(parts[0])), []byte(parts[1])) {
-		return "", errors.New("invalid session")
+	a := &Auth{Config: c, Users: u, Client: &http.Client{Timeout: 10 * time.Second}, TokenURL: "https://github.com/login/oauth/access_token", ProfileURL: "https://api.github.com/user"}
+	if store, ok := u.(users.Store); ok {
+		a.Sessions = sessions.Store{DB: store.DB}
 	}
-	b, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return "", err
+	return a
+}
+func (a *Auth) CookieName(name string) string {
+	if a.Config.Production {
+		return "__Host-secureshare_" + name
 	}
-	var s session
-	if json.Unmarshal(b, &s) != nil || s.ID == "" || s.Expires <= time.Now().Unix() {
-		return "", errors.New("expired session")
-	}
-	return s.ID, nil
+	return "secureshare_" + name
 }
 func (a *Auth) cookie(w http.ResponseWriter, name, value string, age int) {
-	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: "/", HttpOnly: true, Secure: a.Config.Production, SameSite: http.SameSiteLaxMode, MaxAge: age})
+	http.SetCookie(w, &http.Cookie{Name: a.CookieName(name), Value: value, Path: "/", HttpOnly: true, Secure: a.Config.Production, SameSite: http.SameSiteLaxMode, MaxAge: age})
+}
+
+type callbackCleared struct{}
+
+// Clear temporary browser state even when the callback limiter fails closed.
+func (a *Auth) CallbackGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a.clearOAuth(w)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), callbackCleared{}, true)))
+	})
+}
+func (a *Auth) clearOAuth(w http.ResponseWriter) {
+	a.cookie(w, "oauth_state", "", -1)
+	a.cookie(w, "oauth_pkce", "", -1)
 }
 func (a *Auth) Start(w http.ResponseWriter, r *http.Request) {
 	if a.Config.ClientID == "" || a.Config.ClientSecret == "" {
@@ -77,20 +74,30 @@ func (a *Auth) Start(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Authentication unavailable", 500)
 		return
 	}
+	verifier, err := shares.Token()
+	if err != nil {
+		http.Error(w, "Authentication unavailable", 500)
+		return
+	}
+	challenge := sha256.Sum256([]byte(verifier))
 	a.cookie(w, "oauth_state", state, 600)
-	q := url.Values{"client_id": {a.Config.ClientID}, "redirect_uri": {a.Config.Callback}, "state": {state}}
+	a.cookie(w, "oauth_pkce", verifier, 600)
+	q := url.Values{"client_id": {a.Config.ClientID}, "redirect_uri": {a.Config.Callback}, "state": {state}, "code_challenge": {base64.RawURLEncoding.EncodeToString(challenge[:])}, "code_challenge_method": {"S256"}}
 	// No scope: GitHub's public profile is sufficient. Access tokens stay in memory.
 	http.Redirect(w, r, "https://github.com/login/oauth/authorize?"+q.Encode(), http.StatusFound)
 }
 func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
-	c, err := r.Cookie("oauth_state")
-	a.cookie(w, "oauth_state", "", -1)
+	c, err := r.Cookie(a.CookieName("oauth_state"))
+	verifier, verifierErr := r.Cookie(a.CookieName("oauth_pkce"))
+	if r.Context().Value(callbackCleared{}) == nil {
+		a.clearOAuth(w)
+	}
 	state := r.URL.Query().Get("state")
-	if err != nil || len(state) != 43 || subtle.ConstantTimeCompare([]byte(c.Value), []byte(state)) != 1 || r.URL.Query().Get("code") == "" {
+	if err != nil || verifierErr != nil || !validVerifier(verifier.Value) || len(state) != 43 || subtle.ConstantTimeCompare([]byte(c.Value), []byte(state)) != 1 || r.URL.Query().Get("code") == "" {
 		http.Error(w, "Invalid OAuth state", 400)
 		return
 	}
-	form := url.Values{"client_id": {a.Config.ClientID}, "client_secret": {a.Config.ClientSecret}, "code": {r.URL.Query().Get("code")}, "redirect_uri": {a.Config.Callback}}
+	form := url.Values{"client_id": {a.Config.ClientID}, "client_secret": {a.Config.ClientSecret}, "code": {r.URL.Query().Get("code")}, "redirect_uri": {a.Config.Callback}, "code_verifier": {verifier.Value}}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, a.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		http.Error(w, "Authentication unavailable", 502)
@@ -136,29 +143,51 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Authentication unavailable", 502)
 		return
 	}
-	u, err := a.Users.Upsert(r.Context(), users.User{GitHubID: profile.ID, Login: profile.Login, Name: profile.Name, AvatarURL: profile.Avatar})
-	if err != nil {
-		http.Error(w, "Authentication unavailable", 500)
-		return
-	}
-	// Profile upsert commits first. Audit must persist before issuing a session;
-	// failed auditing leaves no login cookie, even though the account may exist.
-	if a.Auditor == nil || a.Auditor.Record(r.Context(), u.ID, nil, "AUTH_LOGIN") != nil {
+	if a.Sessions == nil {
 		http.Error(w, "Authentication unavailable", 503)
 		return
 	}
-	a.cookie(w, "session", a.Issue(u.ID), 7*24*3600)
+	raw, expiry, err := a.Sessions.Login(r.Context(), users.User{GitHubID: profile.ID, Login: profile.Login, Name: profile.Name, AvatarURL: profile.Avatar})
+	if err != nil {
+		http.Error(w, "Authentication unavailable", 503)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: a.CookieName("session"), Value: raw, Path: "/", HttpOnly: true, Secure: a.Config.Production, SameSite: http.SameSiteLaxMode, Expires: expiry, MaxAge: int(time.Until(expiry).Seconds())})
 	http.Redirect(w, r, a.Config.Origin+"/dashboard", http.StatusFound)
 }
 func (a *Auth) User(r *http.Request) (users.User, error) {
-	c, err := r.Cookie("session")
+	c, err := r.Cookie(a.CookieName("session"))
 	if err != nil {
 		return users.User{}, err
 	}
-	id, err := a.Verify(c.Value)
+	if a.Sessions == nil {
+		return users.User{}, errors.New("session unavailable")
+	}
+	id, err := a.Sessions.Lookup(r.Context(), c.Value)
 	if err != nil {
 		return users.User{}, err
 	}
 	return a.Users.Get(r.Context(), id)
 }
-func (a *Auth) Logout(w http.ResponseWriter) { a.cookie(w, "session", "", -1) }
+func (a *Auth) Logout(w http.ResponseWriter, r *http.Request) error {
+	c, err := r.Cookie(a.CookieName("session"))
+	if err != nil || a.Sessions == nil {
+		return errors.New("session unavailable")
+	}
+	if err = a.Sessions.Revoke(r.Context(), c.Value); err != nil {
+		return err
+	}
+	a.cookie(w, "session", "", -1)
+	return nil
+}
+func validVerifier(value string) bool {
+	if len(value) < 43 || len(value) > 128 {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == '~') {
+			return false
+		}
+	}
+	return true
+}

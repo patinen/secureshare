@@ -7,7 +7,7 @@ import (
 )
 
 func TestWorkerConfig(t *testing.T) {
-	for _, name := range []string{"CLEANUP_INTERVAL", "FILE_RETENTION_GRACE", "PENDING_UPLOAD_GRACE", "UPLOAD_TEMP_DIR", "SESSION_SECRET", "WEB_ORIGIN", "GITHUB_CALLBACK_URL", "S3_ENDPOINT", "S3_DOWNLOAD_ENDPOINT", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_USE_PATH_STYLE", "ENVIRONMENT"} {
+	for _, name := range []string{"CLEANUP_INTERVAL", "FILE_RETENTION_GRACE", "PENDING_UPLOAD_GRACE", "UPLOAD_TEMP_DIR", "WEB_ORIGIN", "GITHUB_CALLBACK_URL", "S3_ENDPOINT", "S3_DOWNLOAD_ENDPOINT", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_USE_PATH_STYLE", "ENVIRONMENT"} {
 		t.Setenv(name, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://local/test")
@@ -41,7 +41,6 @@ func TestSecurityConfig(t *testing.T) {
 		t.Setenv(name, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://local/test")
-	t.Setenv("SESSION_SECRET", strings.Repeat("s", 32))
 	t.Setenv("RATE_LIMIT_KEY_SECRET", strings.Repeat("r", 32))
 	t.Setenv("REDIS_URL", "redis://local:6379/0")
 	t.Setenv("WEB_ORIGIN", "http://localhost:3000")
@@ -54,7 +53,7 @@ func TestSecurityConfig(t *testing.T) {
 			t.Fatal("invalid security defaults")
 		}
 	})
-	for _, c := range []struct{ name, value string }{{"REDIS_URL", ""}, {"REDIS_URL", "http://local"}, {"RATE_LIMIT_KEY_SECRET", "short"}, {"RATE_LIMIT_KEY_SECRET", strings.Repeat("s", 32)}, {"TRUSTED_PROXY_CIDRS", "invalid"}, {"MAX_STORED_FILE_BYTES_PER_USER", "0"}, {"MAX_STORED_FILE_BYTES_PER_USER", "-1"}, {"MAX_NONTERMINAL_SHARES_PER_USER", "0"}, {"MAX_NONTERMINAL_SHARES_PER_USER", "1000001"}} {
+	for _, c := range []struct{ name, value string }{{"REDIS_URL", ""}, {"REDIS_URL", "http://local"}, {"RATE_LIMIT_KEY_SECRET", "short"}, {"TRUSTED_PROXY_CIDRS", "invalid"}, {"MAX_STORED_FILE_BYTES_PER_USER", "0"}, {"MAX_STORED_FILE_BYTES_PER_USER", "-1"}, {"MAX_NONTERMINAL_SHARES_PER_USER", "0"}, {"MAX_NONTERMINAL_SHARES_PER_USER", "1000001"}} {
 		t.Run("invalid_"+c.name+"_"+c.value, func(t *testing.T) {
 			t.Setenv(c.name, c.value)
 			if _, err := Load(); err == nil {

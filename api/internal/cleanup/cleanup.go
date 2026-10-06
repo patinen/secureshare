@@ -27,8 +27,8 @@ func (o Options) Validate() error {
 }
 
 type Stats struct {
-	PendingRemoved, Purged, TempRemoved, Failures int
-	Skipped                                       bool
+	PendingRemoved, Purged, TempRemoved, SessionsRemoved, Failures int
+	Skipped                                                        bool
 }
 type Runner struct {
 	DB      *pgxpool.Pool
@@ -123,6 +123,13 @@ func (r Runner) RunOnce(ctx context.Context) (stats Stats, err error) {
 		if state == "READY" {
 			stats.Purged++
 		}
+	}
+	// Retain terminal sessions seven days, then delete at most 200 per sweep.
+	result, sessionErr := conn.Exec(ctx, `DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE expires_at<clock_timestamp()-interval '7 days' OR revoked_at<clock_timestamp()-interval '7 days' ORDER BY created_at,id LIMIT 200 FOR UPDATE SKIP LOCKED)`)
+	if sessionErr != nil {
+		stats.Failures++
+	} else {
+		stats.SessionsRemoved = int(result.RowsAffected())
 	}
 	removed, queryFailures, sweepErr := uploads.Sweep(r.Options.TempDir, pendingBefore)
 	stats.TempRemoved = removed

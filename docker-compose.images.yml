@@ -1,0 +1,74 @@
+# Local acceptance of production-built artifacts, NOT production deployment.
+# docker compose -f docker-compose.yml -f docker-compose.images.yml up -d api-image worker-image web-image
+services:
+  api-image:
+    image: secureshare-api:phase5a
+    build: ./api
+    env_file: ./api/.env
+    environment:
+      ENVIRONMENT: development # local HTTP MinIO; production requires HTTPS
+      DATABASE_URL: postgres://secureshare_local:local_development_only@postgres:5432/secureshare_local?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_DOWNLOAD_ENDPOINT: http://localhost:59000
+      UPLOAD_TEMP_DIR: /var/lib/secureshare/uploads
+    ports: ["127.0.0.1:58080:8080"]
+    volumes: ["image_spool:/var/lib/secureshare/uploads"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 20s
+    healthcheck:
+      test: [CMD, /app/probe]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+  worker-image:
+    image: secureshare-api:phase5a
+    command: [/app/worker]
+    env_file: ./api/.env
+    environment:
+      ENVIRONMENT: development
+      DATABASE_URL: postgres://secureshare_local:local_development_only@postgres:5432/secureshare_local?sslmode=disable
+      S3_ENDPOINT: http://minio:9000
+      S3_DOWNLOAD_ENDPOINT: http://localhost:59000
+      UPLOAD_TEMP_DIR: /var/lib/secureshare/uploads
+      REDIS_URL: ""
+      RATE_LIMIT_KEY_SECRET: ""
+    volumes: ["image_spool:/var/lib/secureshare/uploads"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+  web-image:
+    image: secureshare-web:phase5a
+    build: ./web
+    environment:
+      API_ORIGIN: http://api-image:8080
+      ENVIRONMENT: production
+      FORWARD_TRUSTED_PROXY_HEADERS: "false"
+    ports: ["127.0.0.1:3000:3000"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 20s
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+volumes:
+  image_spool:

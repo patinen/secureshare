@@ -56,7 +56,7 @@ func run(once bool) bool {
 			log.Print("SecureShare cleanup worker stopped")
 			return true
 		}
-		log.Printf("cleanup pending_removed=%d purged=%d temporary_removed=%d failures=%d skipped=%t", stats.PendingRemoved, stats.Purged, stats.TempRemoved, stats.Failures, stats.Skipped)
+		log.Printf("cleanup pending_removed=%d purged=%d temporary_removed=%d sessions_removed=%d failures=%d skipped=%t", stats.PendingRemoved, stats.Purged, stats.TempRemoved, stats.SessionsRemoved, stats.Failures, stats.Skipped)
 		if err != nil {
 			log.Print("cleanup sweep failed")
 		}

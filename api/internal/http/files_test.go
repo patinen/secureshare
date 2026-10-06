@@ -115,7 +115,7 @@ func TestFileIntegration(t *testing.T) {
 	}()
 	objects := &fakeObjects{}
 	store := shares.Store{DB: db, Objects: objects, TempDir: scratch}
-	a := auth.New(config.Config{Origin: "http://localhost:3000", Secret: strings.Repeat("s", 32)}, us)
+	a := auth.New(config.Config{Origin: "http://localhost:3000"}, us)
 	handler := Router(a, store, Options{Limiter: allowAll{}})
 	call := func(method, path, who string, body io.Reader, contentType string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, body)
@@ -123,7 +123,7 @@ func TestFileIntegration(t *testing.T) {
 		r.Header.Set("Origin", a.Config.Origin)
 		r.Header.Set("Content-Type", contentType)
 		if who != "" {
-			r.AddCookie(&http.Cookie{Name: "session", Value: a.Issue(who)})
+			r.AddCookie(&http.Cookie{Name: a.CookieName("session"), Value: testSession(t, a, who)})
 		}
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, r)

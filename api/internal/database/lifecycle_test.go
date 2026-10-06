@@ -10,7 +10,7 @@ import (
 )
 
 func TestLifecycleMigration(t *testing.T) {
-	for _, c := range []struct{ name, hash string }{{"001_foundation.sql", "5a780d6d2062d3303d7951e6494810fd475438e341300c3ec75aa3baf6abb243"}, {"002_file_shares.sql", "544c064d69400a716d85e409dc0d4b53883956299ff0d20d69ccf96f917cd55f"}, {"003_file_lifecycle.sql", "ffcd3d67e547b354ef67cd733a3dc161866f68bad8463889f48cfb3f2f934c05"}} {
+	for _, c := range []struct{ name, hash string }{{"001_foundation.sql", "5a780d6d2062d3303d7951e6494810fd475438e341300c3ec75aa3baf6abb243"}, {"002_file_shares.sql", "544c064d69400a716d85e409dc0d4b53883956299ff0d20d69ccf96f917cd55f"}, {"003_file_lifecycle.sql", "ffcd3d67e547b354ef67cd733a3dc161866f68bad8463889f48cfb3f2f934c05"}, {"004_security_audit.sql", "eb82201b7fad2b10dfc2f698a216ded2a4a194f4804d83765afbd61fe328a4fa"}} {
 		t.Run(c.name+"_unchanged", func(t *testing.T) {
 			b, err := migrations.Files.ReadFile(c.name)
 			if err != nil || fmt.Sprintf("%x", sha256.Sum256(b)) != c.hash {

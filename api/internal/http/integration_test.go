@@ -48,7 +48,7 @@ func TestIntegration(t *testing.T) {
 		_, _ = db.Exec(ctx, "DELETE FROM shares WHERE user_id=$1 OR user_id=$2", owner.ID, foreign.ID)
 		_, _ = db.Exec(ctx, "DELETE FROM users WHERE id=$1 OR id=$2", owner.ID, foreign.ID)
 	}()
-	a := auth.New(config.Config{Origin: "http://localhost:3000", Secret: strings.Repeat("s", 32)}, us)
+	a := auth.New(config.Config{Origin: "http://localhost:3000"}, us)
 	store := shares.Store{DB: db}
 	handler := Router(a, store, Options{Limiter: allowAll{}})
 	call := func(method, path, who string, body any) *httptest.ResponseRecorder {
@@ -60,7 +60,7 @@ func TestIntegration(t *testing.T) {
 		r.Header.Set("Origin", a.Config.Origin)
 		r.Header.Set("Content-Type", "application/json")
 		if who != "" {
-			r.AddCookie(&http.Cookie{Name: "session", Value: a.Issue(who)})
+			r.AddCookie(&http.Cookie{Name: a.CookieName("session"), Value: testSession(t, a, who)})
 		}
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, r)

@@ -35,9 +35,6 @@ func Router(a *auth.Auth, s shares.Store, settings ...Options) http.Handler {
 		opts = settings[0]
 	}
 	activity := audit.Store{DB: s.DB}
-	if a.Auditor == nil {
-		a.Auditor = activity
-	}
 	ip := func(r *http.Request) (string, error) {
 		addr, err := a.Config.ClientIP.Resolve(r)
 		return addr.String(), err
@@ -59,6 +56,7 @@ func Router(a *auth.Auth, s shares.Store, settings ...Options) http.Handler {
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive")
 			w.Header().Set("Referrer-Policy", "no-referrer")
 			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("X-Frame-Options", "DENY")
@@ -84,13 +82,12 @@ func Router(a *auth.Auth, s shares.Store, settings ...Options) http.Handler {
 		write(w, 200, map[string]string{"status": "ready"})
 	})
 	r.With(protectIP(ratelimit.OAuthStart)).Get("/auth/github", a.Start)
-	r.With(protectIP(ratelimit.OAuthCallback)).Get("/auth/github/callback", a.Callback)
+	r.With(a.CallbackGate, protectIP(ratelimit.OAuthCallback)).Get("/auth/github/callback", a.Callback)
 	r.With(authenticated, protectUser(ratelimit.Logout)).Post("/auth/logout", func(w http.ResponseWriter, r *http.Request) {
-		if activity.Record(r.Context(), currentUser(r).ID, nil, "AUTH_LOGOUT") != nil {
+		if a.Logout(w, r) != nil {
 			fail(w, 503, "Service temporarily unavailable")
 			return
 		}
-		a.Logout(w)
 		w.WriteHeader(204)
 	})
 	r.With(authenticated).Get("/audit", func(w http.ResponseWriter, r *http.Request) {

@@ -1,0 +1,8 @@
+.env*
+!.env.example
+.validation
+server
+worker
+*.test
+coverage*
+.git
