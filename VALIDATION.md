@@ -1,5 +1,7 @@
 # Phase 5A validation — 2026-10-06
 
+> Historical local-validation record. This section is preserved from Phase 5A; statements about deployment and checks still awaiting Phase 5B describe that milestone. Current live evidence and remaining checks are recorded in [Phase 5B live deployment validation](#phase-5b-live-deployment-validation) below.
+
 Implemented from clean HEAD **ce4c4382d04dfa81654723c0f463ef5ef5628efb**. All changes are under `secureshare/`; sibling projects were not modified. HEAD remains unchanged. No commit, push, external deployment or external infrastructure modification was performed. Migrations **001–004 are unchanged**; only `005_sessions.sql` was added. Checked-in examples and images contain no production secrets.
 
 ## LOCALLY VERIFIED
@@ -110,3 +112,86 @@ Docker SIGTERM stopped API/worker with exit 0. Standalone Next exited 143 withou
 The exact resource fields, runtime variable checklist, provider procedure and ordered manual smoke checklist are in [DEPLOYMENT.md](DEPLOYMENT.md). No external resource was created/changed and no deployment job was added. CI configuration was validated through equivalent local checks; GitHub Actions itself has not run because nothing was pushed.
 
 Remaining scope limits: no malware scanning/end-to-end encryption/billing, latest-200 shares/latest-50 activity without paging, audit guards not privileged-admin-proof, Redis resets/eviction reset buckets, storage/DB crash and late-operation reconciliation limits, presigned URLs reusable until expiry and transfers may finish afterward. Revocation does not cancel an already authorized in-flight request. Local pinned MinIO community source remains development infrastructure. Production logs/caches require the review described in the deployment guide.
+
+# Phase 5B live deployment validation
+
+**Evidence date: 2026-10-06.** The results below record the deployment evidence supplied by the project owner for this presentation pass. They were not independently rerun during this documentation edit. Phase 5A local/automated results above remain a separate historical baseline; no new test counts, benchmarks or production checks are inferred.
+
+Status meanings: **PASS** = established by the supplied evidence; **PARTIAL** = limited evidence with explicit scope; **DEFERRED** = no completed live validation supplied. Implementation and local tests do not establish that every deployment setting has been independently audited.
+
+## Deployment/networking
+
+| Check | Status | Evidence / scope |
+|---|---|---|
+| Live deployment | PASS | Running on the existing Hetzner VPS with Coolify and Traefik; [public Web application](https://secureshare.pat1.online) works over HTTPS. |
+| HTTP redirect | PASS | HTTP returns a 307 redirect to HTTPS. |
+| Private application/data services | PASS | Go API has no public domain or host port. PostgreSQL, Redis and cleanup worker have no public host ports. Web reaches API through the private Docker network. |
+| Complete operational configuration review | DEFERRED | This evidence does not establish all checklist details, such as deployed image-digest equality, spool ownership, every readiness probe or direct-origin isolation. |
+
+## R2 provider
+
+| Check | Status | Evidence / scope |
+|---|---|---|
+| Private bucket and credential scope | PASS | Public bucket access disabled; bucket-scoped Object Read & Write credentials used. No account IDs, keys or bucket identifiers are recorded here. |
+| Provider configuration | PASS | EU jurisdiction endpoint, region `auto`, path-style addressing disabled (`S3_USE_PATH_STYLE=false`). |
+| Real provider acceptance | PASS | Put, PresignGet, downloaded byte comparison, unsigned request denial, Delete, signed post-delete denial and idempotent Delete of a nonexistent object passed. |
+| Application retention-driven purge | DEFERRED | A successful provider Delete is not evidence that the application's READY → PURGED workflow has completed against production R2. |
+
+The current provider-check source at the expected HEAD accepts unsigned 401/403/404 and a narrowly matched R2 400 XML response (`Code=InvalidArgument`, `Message=Authorization`). It does not treat arbitrary HTTP 400 responses as denial. This source detail updates the operational guide; it is not an additional live test result.
+
+## OAuth/sessions
+
+| Check | Status | Evidence / scope |
+|---|---|---|
+| Real GitHub sign-in | PASS | Login succeeds with the exact production callback; a server-side PostgreSQL session is created. |
+| Logout and copied-cookie revocation | PASS | Logout succeeds. A cookie copied before logout was replayed afterward; `/api/auth/me` returned 401. Server-side revocation is therefore live-tested. |
+| Additional OAuth/session checks | DEFERRED | Live state/PKCE rejection cases, wildcard-setting review, explicit cookie-attribute inspection, audit-failure behavior and multi-session checks are not established by the supplied live evidence. Their implementation/local tests remain documented above. |
+
+## TEXT/FILE flows and cleanup
+
+| Check | Status | Evidence / scope |
+|---|---|---|
+| One-time TEXT | PASS | Capability sharing succeeds, count reaches 1/1 and a later redemption becomes unavailable. |
+| One-time FILE through R2 | PASS | Sharing through the real provider succeeds, count reaches 1/1 and a later redemption becomes unavailable. The production FILE record reached READY + exhausted. |
+| Continuous cleanup worker | PASS | Worker is running and completing sweeps without reported failures. This establishes operation, not that every cleanup path has executed. |
+| Production READY → PURGED | DEFERRED | Still pending at this presentation pass; no subsequent repository evidence of completed production purge was found. |
+| Other live share/lifecycle checks | DEFERRED | No additional live evidence establishes redemption races, stale-upload recovery, session-retention cleanup, quotas or the complete audit/privacy checks. Local regression evidence remains available above. |
+
+## Redis / client-IP rate limiting
+
+| Check | Status | Evidence / scope |
+|---|---|---|
+| Public redemption limit | PASS | First ten requests returned the expected application 404; following requests returned 429. |
+| Fake X-Forwarded-For | PASS | Supplying a fake X-Forwarded-For did not produce a fresh limiter bucket in the tested flow. |
+| Configured forwarding path | PASS | Traefik trusts forwarded headers from configured Cloudflare CIDRs; `FORWARD_TRUSTED_PROXY_HEADERS=true` is enabled after trust-chain setup. API configuration trusts a narrow Web/BFF peer identity plus required trusted edge ranges. |
+| Independent-client isolation | PARTIAL | An independent mobile-network connection immediately received 404 while the original client was limited. The secondary network was unstable; evidence is limited, not exhaustive multi-client or penetration testing. |
+| Stable trusted peer identity | DEFERRED | The trusted exact Web container IP can change on redeployment. Go falls back safely to its immediate peer; per-client limits may aggregate until configuration is updated. Follow-up: stable, narrowly scoped proxy identity/network. |
+| Full live outage/direct-origin checks | DEFERRED | No live Redis outage, exhaustive spoofing/direct-origin test or complete forwarding-configuration audit is established here. |
+
+No internal production IPs or container identifiers are published. A successful spoofing check does not justify broadening trusted CIDRs.
+
+## HTTPS/browser headers
+
+**PASS:** a live HTTPS response was verified with:
+
+- `Cache-Control: no-store`;
+- nonce-based CSP with `script-src` containing neither unsafe-inline nor unsafe-eval;
+- `Strict-Transport-Security: max-age=31536000`;
+- `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`;
+- `Referrer-Policy: no-referrer` and restrictive Permissions-Policy.
+
+HTTP's 307 HTTPS redirect is also verified. **DEFERRED:** this response sample does not establish every route's headers, nonce changes across live requests, a complete live robots/noindex review or a full production logging/privacy audit. Phase 5A browser tests cover the local implementation separately.
+
+## PostgreSQL backup
+
+| Check | Status | Evidence / scope |
+|---|---|---|
+| Scheduled backup | PASS | Coolify PostgreSQL backup is enabled for database `postgres`, daily, with local retention of seven backups. |
+| Manual backup execution | PASS | An explicit manual execution completed successfully. |
+| Off-site backup and restore test | DEFERRED | Neither is complete. Successful backup creation alone does not prove recoverability. |
+
+## Outstanding live validation
+
+The principal follow-ups are production R2 READY → PURGED evidence, off-site backups and a restore test, a stable narrowly trusted Web/BFF identity, broader independent-client/direct-origin checks, live Redis outage behavior and a full logging/privacy review. Additional OAuth, header, audit, quota and recovery acceptance details remain open wherever the tables above mark them DEFERRED.
+
+Use [DEPLOYMENT.md](DEPLOYMENT.md#ordered-phase-5b-smoke-checklist) as the operational checklist. Preserve the completed evidence, record new checks separately, and do not infer production completion from a local test or a continuously running worker. SecureShare remains **not end-to-end encrypted** and has no malware scanning.

@@ -1,61 +1,87 @@
 # SecureShare
 
-SecureShare shares temporary text and private files through capability links. Creators sign in with GitHub, set expiration and access limits, and see successful actions in a private activity feed. Recipients need only the secret link and explicitly choose to open or download.
+SecureShare lets people share temporary text and private files through secret links, with expiration and access limits. Creators sign in with GitHub; recipients need only the link and explicitly choose to open the message or download the file.
 
-## Why this project exists
+**Live demo:** [https://secureshare.pat1.online](https://secureshare.pat1.online)
 
-Sending a message or file should not imply permanent availability. This project explores the difficult boundaries behind temporary sharing: concurrent redemption, private object storage, interrupted uploads, revocable authentication, and cleanup that remains safe after failures.
+**Built with:** Go · Next.js / React / TypeScript · PostgreSQL · Redis · Cloudflare R2 · Docker
 
-Built with Go, PostgreSQL 16, Redis 7, Next.js 16 and a provider-neutral AWS SDK v2 S3 adapter. Production packaging targets separate Coolify resources behind Cloudflare/Traefik; a real external deployment remains a controlled follow-up.
+Only the Next.js Web application is public. Its same-origin BFF connects to a private Go API; the database, Redis, object storage and cleanup worker remain private.
 
-## Security model
+## Why SecureShare
 
-- **Bearer capability links:** anyone holding a link can access it within its limits. A 32-byte cryptographically random token is shown once; PostgreSQL stores only SHA-256 hashes. URLs cannot be reconstructed. Keep links out of logs, analytics and search metadata.
-- **Atomic redemption:** POST explicitly consumes access through a conditional PostgreSQL update. Concurrent attempts on a one-time share have exactly one winner. Unknown, expired, exhausted and revoked shares return the same public unavailable response. GET never redeems.
-- **Private files:** uploads up to 25 MiB use a private spool and private object storage. Downloads are attachment/octet-stream/no-store, with sanitized filenames and signed URLs valid at most 60 seconds, capped by share lifetime. Issued URLs can be reused until expiry; revocation cannot invalidate them immediately, and a started transfer may finish later.
-- **Durable lifecycle:** FILE records reserve independently random object keys as PENDING before Put; successful uploads become READY. The coordinated worker recovers stale PENDING uploads, removes old spool files and purges terminal objects after retention, retaining safe PURGED metadata and activity.
-- **Revocable sessions:** GitHub OAuth uses random state and S256 PKCE, with no requested scopes beyond public profile access. A seven-day opaque cookie has 32 random bytes; only its SHA-256 hash is stored. Profile/session/AUTH_LOGIN commit together; logout atomically revokes the current session and records AUTH_LOGOUT before clearing its cookie. Copied logged-out cookies fail; multiple sessions coexist. GitHub tokens are never persisted. No signing secret is needed.
-- **Abuse controls:** Redis atomic Lua token buckets use server time and opaque HMAC actor keys, bounded expiration and Retry-After. Required protected operations fail closed during Redis outages. PostgreSQL user-row locks serialize quota reservations before upload: default 512 MiB stored files and 500 nonterminal shares per creator.
-- **Audit and privacy:** append-only PostgreSQL events commit with successful operations; only owners can read their history. Mutation/truncate guards prevent ordinary audit edits (not a privileged administrator). Random request IDs correlate safe route-template logs without raw URLs, tokens, IPs or cookies.
-- **Browser defenses:** dynamic HTML uses per-request CSP script nonces without production unsafe-inline/unsafe-eval; style unsafe-inline remains separate. Referrer/no-store headers, noindex/noarchive and robots rules protect capability pages. These are additional defenses, not authorization.
+Temporary sharing is a concurrency and failure-recovery problem. Two recipients can open a one-time link at once, an upload can fail between object storage and a database commit, and logging a URL can expose its bearer secret. SecureShare addresses these boundaries with atomic database operations, a durable file lifecycle and explicit privacy controls.
 
-This application is **not end-to-end encrypted**. The database/object store contain readable content. Recipients must assess downloaded files before opening them locally; forced download is not malware scanning.
+## Highlights
+
+- **Secret links and atomic redemption:** hash-only capability storage; exactly one winner when requests race for a one-time share.
+- **Durable file lifecycle:** PENDING → READY → PURGED, a shared private upload spool, and coordinated recovery/cleanup without bucket-wide listing.
+- **Private R2 storage:** short-lived signed attachment downloads; the real provider's Put/Get/Delete behavior has been checked.
+- **Revocable authentication:** GitHub OAuth with state + S256 PKCE; PostgreSQL sessions whose copied cookies stop authenticating after logout.
+- **Abuse controls and accountability:** distributed Redis rate limiting, transactional creator quotas and an append-only audit trail.
+- **Production browser controls:** nonce-based script CSP, no-referrer/no-store responses and capability-page indexing defenses.
+- **Live deployment:** Hetzner, Coolify, Traefik and Cloudflare, with documented local tests, live evidence and remaining operational checks.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    Browser --> Edge[Cloudflare / Traefik]
-    Edge --> Web[Next.js Web ? only public domain]
-    Web -->|same-origin API BFF ? private network| API[Go API]
+    Browser[Browser] --> CF[Cloudflare]
+    CF --> Edge[Traefik / Coolify]
+    Edge --> Web[Next.js Web / BFF]
+    Web -->|private network| API[Go API]
     API --> PG[(PostgreSQL)]
-    API --> Redis[(Redis limiter)]
-    API --> S3[(Private S3 / R2)]
-    Worker[Private cleanup worker] --> PG
-    Worker --> S3
+    API --> Redis[(Redis)]
+    API --> R2[(Private Cloudflare R2)]
     API --- Spool[Shared private upload spool]
+    Worker[Private cleanup worker] --> PG
+    Worker --> R2
     Worker --- Spool
-    Browser -->|short signed attachment download| S3
+    Browser -->|short-lived signed download| R2
 ```
 
-The BFF streams bounded uploads and uses server-only runtime `API_ORIGIN`; browsers call `/api/*` on the web origin. API has no public domain; worker has no HTTP port. Client IP forwarding defaults off. Enabling it asserts an isolated, sanitizing trusted edge; bounded valid XFF is forwarded and Go resolves right to left against explicit trusted CIDRs. See the live spoofing acceptance gate in [DEPLOYMENT.md](DEPLOYMENT.md).
+Browsers call `/api/*` on the public web origin. The BFF streams bounded uploads and uses server-only runtime `API_ORIGIN`. The worker coordinates sweeps through PostgreSQL and needs neither Redis nor an HTTP server.
 
-## Key engineering challenges
+## Security model
 
-Object upload and PostgreSQL are not a distributed transaction. Reserving PENDING state before Put makes cleanup discoverable without bucket List; row locks serialize finalization and deletion. Lost acknowledgements and very late provider operations still require operational reconciliation. A successful READY upload whose response is lost can leave a valid share whose once-visible URL the creator never received.
+Capability URLs are **bearer secrets**: anyone holding a link can use its remaining access. A cryptographically random token is shown once; only its SHA-256 hash is stored. GET does not consume access. POST redemption uses an atomic PostgreSQL update; unknown, revoked, expired and exhausted shares intentionally look the same publicly.
 
-Redemption signing happens before database commit, so signing/audit failures roll back access counts. Delivery failures after commit consume access. Quotas count PENDING/READY stored bytes even if a share is terminal and awaiting purge; PURGED/TEXT consume zero stored bytes. Share count covers PENDING and live TEXT/READY; history does not block creation. All creator reservations lock the same user row to prevent races.
+GitHub OAuth uses state and S256 PKCE without requesting additional scopes. Application sessions are opaque, server-side PostgreSQL records with hash-only token storage. Login/session/audit and logout/revocation/audit commit together; GitHub access tokens remain memory-only.
 
-The cleanup worker holds one pinned PostgreSQL session advisory lock across each sweep; individual records use row locking and retry-safe deletion. It needs no Redis. Sessions are removed in bounded batches of 200, seven days after expiry/revocation. Embedded migrations run under a separate transaction advisory lock, allowing API and worker to start concurrently.
+Redis token buckets use HMAC-derived identities rather than raw IPs. Go resolves trusted forwarding chains, while PostgreSQL serializes quota reservations before upload. Audit events record successful actions without storing content or secret URLs.
+
+Files stay private and download as attachments through presigned URLs valid for at most 60 seconds, capped by share lifetime. An issued URL can be reused until expiry; revocation stops new redemptions but cannot cancel an already issued URL or a started transfer.
+
+**SecureShare is not end-to-end encrypted.** The service can read stored content. Forced downloads, CSP and indexing defenses do not replace malware scanning or control what a recipient does with downloaded data.
+
+## Production deployment
+
+[SecureShare is live over HTTPS](https://secureshare.pat1.online) on a Hetzner VPS managed by Coolify and Traefik behind Cloudflare. Web reaches the private Go API over Docker networking. API, PostgreSQL, Redis and worker have no public host ports; API has no public domain. Files use a private Cloudflare R2 bucket with bucket-scoped credentials and an EU jurisdiction endpoint.
+
+The supplied live evidence from **2026-10-06** establishes HTTPS and HTTP redirect, the real R2 provider check, GitHub login, session revocation after cookie replay, one-time TEXT/FILE flows and a limited client-IP rate-limit check. The cleanup worker is running; production READY → PURGED verification remains pending.
+
+See [live validation](VALIDATION.md#phase-5b-live-deployment-validation) for the evidence and its limits, and [the deployment guide](DEPLOYMENT.md) for operations and remaining hardening checks.
+
+## Tech stack
+
+| Area | Technologies |
+|---|---|
+| Frontend | Next.js 16.3.8, React 19.2.8, TypeScript; npm; standalone Node 24 runtime |
+| Backend | Go 1.26, chi, pgx, AWS SDK for Go v2, go-redis v9 |
+| Data | PostgreSQL 16, Redis 7, private Cloudflare R2; MinIO for local development |
+| Infrastructure | Docker multi-stage/non-root images, Hetzner VPS, Coolify, Traefik, Cloudflare |
+| Security/testing | OAuth PKCE, opaque sessions, atomic SQL, Redis Lua, nonce CSP, Go race tests, local mocks, browser acceptance, GitHub Actions CI |
 
 ## Local development
 
-Prerequisites: Docker Compose, Node 24 (or a supported Node version compatible with Next), npm. Go 1.26 runs in Docker. All Compose credentials/loopback bindings are explicitly development-only; the pinned local MinIO source build is not a production recommendation.
+Prerequisites: Git, Docker Compose and Node 24 with npm. Go runs in Linux containers. Compose credentials and loopback ports are **development-only**; never reuse them in production.
 
 ```sh
+git clone https://github.com/patinen/secureshare.git
+cd secureshare
 cp api/.env.example api/.env
 cp web/.env.example web/.env.local
-# Generate RATE_LIMIT_KEY_SECRET and put it in ignored api/.env:
+# Generate a local limiter key and set RATE_LIMIT_KEY_SECRET in ignored api/.env:
 node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 docker compose up -d postgres redis minio minio-init api worker
 cd web
@@ -63,17 +89,22 @@ npm ci
 npm run dev
 ```
 
-Visit `http://localhost:3000`. Register a **separate local** GitHub OAuth App using homepage `http://localhost:3000` and exact callback `http://localhost:3000/api/auth/github/callback`, then populate ignored API credentials and restart API. There is no application authentication bypass. Production uses Secure __Host cookies and exact HTTPS configuration separately. Local API health is `http://localhost:8080/health`; readiness is `/ready`. Private MinIO uses loopback 59000, console 59001. Compose shares `/var/lib/secureshare/uploads` between API/worker. Native Windows does not support the Unix spool ownership policy; use Linux containers for API/worker.
+Open `http://localhost:3000`. For sign-in, register a **separate development** GitHub OAuth App with homepage `http://localhost:3000` and exact callback `http://localhost:3000/api/auth/github/callback`. Set its credentials only in ignored `api/.env`, then recreate API with `docker compose up -d --force-recreate api` from the repository root. There is no authentication bypass.
+
+Local API liveness is `http://localhost:8080/health`; readiness is `/ready`. MinIO uses loopback ports 59000 (S3 API) and 59001 (console). API and worker share `/var/lib/secureshare/uploads`; ownership/private-permission checks remain enabled. On Windows, use Linux containers for the API/worker rather than native Windows spool handling. [Production-image local acceptance](docker-compose.images.yml) is separate from this development setup.
 
 ## Testing
 
-Create a dedicated local `secureshare_test` database once (never run integration tests against production). Tests isolate schemas and serialize cross-package fixture setup while preserving real in-fixture concurrency. Mock GitHub and storage servers are local; no public internet is used by application tests.
+Recorded Phase 5A validation includes **276 Go leaf cases across 30 test functions**, **13 frontend forwarding tests**, race/vet/build checks, production image builds and browser acceptance. Tests cover redemption races, lifecycle recovery, quotas, limiting, audit ownership, proxies, PKCE and session revocation. These are the preserved Phase 5A results, not a newly measured count for the later provider-response change.
+
+Run from the repository root. Create the dedicated local test database once; never point tests at production. PostgreSQL tests isolate schemas and use real concurrent operations; GitHub/storage mocks are local. Integration suites skip without the test URLs, so supply both explicitly:
 
 ```sh
 docker compose exec postgres createdb -U secureshare_local secureshare_test
 docker compose run --rm --no-deps \
   -e TEST_DATABASE_URL='postgres://secureshare_local:local_development_only@postgres:5432/secureshare_test?sslmode=disable' \
   -e TEST_REDIS_URL=redis://redis:6379/15 api go test -race ./...
+docker compose run --rm --no-deps api go fmt ./...
 docker compose run --rm --no-deps api go vet ./...
 docker compose run --rm --no-deps api go build ./cmd/server
 docker compose run --rm --no-deps api go build ./cmd/worker
@@ -86,22 +117,16 @@ npm run build
 npm audit --omit=dev
 ```
 
-Tests cover migration integrity/upgrades, atomic TEXT/FILE races, lifecycle retries, quotas, Redis limiting, trusted proxies, audit ownership/rollback, PKCE and session revocation/cleanup. The GitHub Actions workflow adds PostgreSQL/Redis services, builds both production images, and has no deploy step or provider credentials. Integration tests skip if test URLs are absent: CI and final validation explicitly provide both.
+[GitHub Actions CI](.github/workflows/ci.yml) uses PostgreSQL/Redis services, local/fake storage and production image builds without production credentials or a deployment job. [VALIDATION.md](VALIDATION.md) records detailed evidence, including the clean Phase 5A production dependency audit and the remaining development-tool advisory.
 
-See [VALIDATION.md](VALIDATION.md) for exact counts, production image acceptance, browser evidence and dependency findings. Manual provider checks require explicit temporary-object authorization and are never run automatically in CI.
+## Known limitations / future hardening
 
-## Production deployment
+- **Content protection:** no E2EE or malware scanning. Stored content and backups require infrastructure access controls.
+- **Download semantics:** presigned URLs remain reusable within their lifetime; committed access can be consumed even if delivery fails. Storage/DB operations are not a distributed transaction and crashes or late operations can require reconciliation.
+- **Production cleanup:** the worker runs without reported sweep failures, but the real R2 READY → PURGED lifecycle still needs live confirmation.
+- **Backup recovery:** daily Coolify PostgreSQL backups and a manual backup have succeeded; off-site backups and restore testing remain pending.
+- **Proxy stability:** the trusted exact Web/BFF peer identity can change on redeploy. Resolution falls back safely to the immediate peer, but client-IP limits can aggregate until configuration is updated. Stabilizing that narrow trusted identity/network is follow-up work; independent-client evidence is limited.
+- **Operational privacy:** a full production logging/privacy review, direct-origin checks and live Redis outage testing remain outstanding. Edge logs must not expose bearer URLs or cookies.
+- **History and controls:** share/activity lists are bounded without pagination; audit guards do not protect against a privileged administrator. Redis resets/eviction reset buckets, and IP limits cannot stop every distributed attacker.
 
-[DEPLOYMENT.md](DEPLOYMENT.md) specifies separate Coolify Web/API/Worker/PostgreSQL/Redis resources, private R2 storage, runtime secrets, shared spool ownership, health checks, sanitizing proxy configuration, and the ordered Phase 5B manual acceptance checklist. Only Web gets `https://secureshare.pat1.online`. Build contexts are `web/` and `api/`; both use non-root multi-stage images with no build-time secrets. API/worker share the same immutable image and UID/GID 10001:10001; Web runs as node 1000:1000.
-
-Real GitHub OAuth, R2, Cloudflare/Traefik forwarding, Coolify and public HTTPS/domain behavior require Phase 5B verification. Local production images do not prove any of those external services.
-
-## Known limitations
-
-- No malware scanning, end-to-end encryption, billing or automated deployment. Files/content/backups require infrastructure access controls.
-- Presigned downloads are reusable within their lifetime; neither delivery nor storage/network effects are exactly once. Storage failures/crashes can leave orphan objects or late writes requiring reconciliation. Provider lock/versioning behavior must satisfy Delete semantics.
-- Session revocation applies to subsequent authentication; already authorized in-flight requests can finish. Session hashes survive up to seven days after expiry/revocation before bounded cleanup. Account-wide revoke-all is not implemented.
-- Latest 200 shares and latest 50 activity events (API maximum 100), no history pagination/retention policy. Audit guards are not privileged-admin-proof/WORM storage.
-- IP controls do not stop every distributed attacker. Redis eviction/restarts/secret rotation reset buckets. Production forwarding must be independently validated; disabled forwarding aggregates browser IP limits at the BFF peer.
-- Next dynamic nonce rendering requires no-store HTML and costs server rendering; inline styles remain permitted. Edge logs/caching must follow the deployment guide to keep bearer URLs private.
-- The full npm audit still reports the documented development-tool braces chain; production dependency audit is separately reported. No forced downgrade is used.
+Completed and deferred live checks are recorded separately in [VALIDATION.md](VALIDATION.md#phase-5b-live-deployment-validation); operational procedures remain in [DEPLOYMENT.md](DEPLOYMENT.md).
